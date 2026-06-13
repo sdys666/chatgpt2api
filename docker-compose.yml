@@ -1,10 +1,13 @@
 services:
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/sdys666/chatgpt2api:latest
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "3004:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
