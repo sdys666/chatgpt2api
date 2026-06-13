@@ -50,7 +50,35 @@ class ChatRequirements:
     so_token: str = ""
     raw_finalize: Optional[Dict[str, Any]] = None
 
+def _config_bool(key: str, default: bool) -> bool:
+    paths = []
 
+    env_path = os.getenv("CHATGPT2API_CONFIG")
+    if env_path:
+        paths.append(Path(env_path))
+
+    paths.extend([
+        Path("/app/config.json"),
+        Path("config.json"),
+    ])
+
+    try:
+        for path in paths:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                value = data.get(key, default)
+
+                if isinstance(value, bool):
+                    return value
+
+                if isinstance(value, str):
+                    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+                return bool(value)
+    except Exception:
+        pass
+
+    return default
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
@@ -487,7 +515,7 @@ class OpenAIBackendAPI:
             "force_paragen_model_slug": "",
             "force_rate_limit": False,
             "force_use_sse": True,
-            "history_and_training_disabled": True,
+            "history_and_training_disabled": _config_bool("history_and_training_disabled", True),
             "reset_rate_limits": False,
             "suggestions": [],
             "supported_encodings": [],
@@ -954,6 +982,7 @@ class OpenAIBackendAPI:
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
             "system_hints": ["picture_v2"],
+            "history_and_training_disabled": _config_bool("history_and_training_disabled", True),
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": {
