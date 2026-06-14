@@ -82,12 +82,81 @@ def _config_bool(key: str, default: bool) -> bool:
     return default
 
 
+def _config_float(key: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
+    paths = []
+
+    env_path = os.getenv("CHATGPT2API_CONFIG")
+    if env_path:
+        paths.append(Path(env_path))
+
+    paths.extend([
+        Path("/app/config.json"),
+        Path(__file__).resolve().parents[1] / "config.json",
+        Path("config.json"),
+    ])
+
+    value = default
+    try:
+        for path in paths:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                value = float(data.get(key, default))
+                break
+    except Exception:
+        value = default
+    if min_value is not None and value < min_value:
+        value = min_value
+    if max_value is not None and value > max_value:
+        value = max_value
+    return value
+
+
+def _config_int(key: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    value = int(_config_float(key, float(default), float(min_value) if min_value is not None else None, float(max_value) if max_value is not None else None))
+    return value
+
+
 def _history_and_training_disabled() -> bool:
     return _config_bool("history_and_training_disabled", True)
 
 
 def _history_and_training_disabled_query() -> str:
     return "true" if _history_and_training_disabled() else "false"
+
+
+def _is_retryable_connection_error(error: object) -> bool:
+    text = str(error or "").lower()
+    return (
+        "curl: (35)" in text
+        or "tls connect error" in text
+        or "openssl_internal" in text
+        or "ssl: wrong_version_number" in text
+        or "ssl: certificate_verify_failed" in text
+        or "curl: (28)" in text
+        or "operation timed out" in text
+        or "connection timed out" in text
+        or "read timed out" in text
+        or "connect timeout" in text
+        or "connection aborted" in text
+        or "remote disconnected" in text
+        or "connection reset by peer" in text
+    )
+
+
+def _text_attachment_timeout_secs() -> float:
+    return _config_float("text_attachment_timeout_secs", 900.0, 60.0, 7200.0)
+
+
+def _text_attachment_request_timeout_secs() -> float:
+    return _config_float("text_attachment_request_timeout_secs", 900.0, 60.0, 7200.0)
+
+
+def _text_attachment_poll_interval_secs() -> float:
+    return _config_float("text_attachment_poll_interval_secs", 3.0, 1.0, 60.0)
+
+
+def _text_attachment_submit_retries() -> int:
+    return _config_int("text_attachment_submit_retries", 3, 1, 10)
 
 
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
@@ -100,8 +169,6 @@ SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
-TEXT_ATTACHMENT_TIMEOUT_SECS = 300.0
-TEXT_ATTACHMENT_POLL_INTERVAL_SECS = 3.0
 TEXT_ATTACHMENT_PENDING_MARKERS = ("连接已中断", "等待完整回复")
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
 EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
@@ -211,6 +278,7 @@ class OpenAIBackendAPI:
         self.progress_callback: Callable[[str], None] | None = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
+            upstream=True,
             impersonate=self.fp["impersonate"],
             verify=True,
         ))
@@ -242,6 +310,20 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
+    def _rebuild_session(self) -> None:
+        headers = dict(getattr(self.session, "headers", {}) or {})
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+            account=self.account,
+            upstream=True,
+            impersonate=self.fp["impersonate"],
+            verify=True,
+        ))
+        self.session.headers.update(headers)
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -1938,12 +2020,23 @@ class OpenAIBackendAPI:
         last_result: Dict[str, Any] | None = None
         last_answer = ""
         stable_hits = 0
+        retryable_errors = 0
         while time.time() < deadline:
             try:
                 last_result = self._extract_text_attachment_result(conversation_id, self._get_search_conversation(conversation_id))
             except UpstreamHTTPError as exc:
                 if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
                     raise
+            except Exception as exc:
+                if not _is_retryable_connection_error(exc):
+                    raise
+                retryable_errors += 1
+                logger.warning({
+                    "event": "text_attachment_poll_retryable_error",
+                    "conversation_id": conversation_id,
+                    "retryable_errors": retryable_errors,
+                    "error": str(exc)[:300],
+                })
             if last_result and last_result.get("answer"):
                 if last_result.get("status") in SEARCH_DONE_STATUS:
                     return last_result
@@ -2827,11 +2920,24 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=300,
+            timeout=_text_attachment_request_timeout_secs(),
             stream=True,
         )
         ensure_ok(response, path)
         return response
+
+    def _open_text_attachment_conversation(
+            self,
+            prompt_text: str,
+            attachments: list[Dict[str, Any]],
+            model: str,
+            effort: str,
+    ) -> requests.Response:
+        uploaded = [self._upload_text_attachment(item, index) for index, item in enumerate(attachments, start=1)]
+        self._bootstrap()
+        requirements = self._get_chat_requirements()
+        conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
+        return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort)
 
     def _stream_text_attachment_conversation(
             self,
@@ -2847,11 +2953,36 @@ class OpenAIBackendAPI:
         if not prompt_text:
             raise RuntimeError("prompt is required for file attachment conversation")
         effort = thinking_effort or ("extended" if "thinking" in model.lower() else "")
-        uploaded = [self._upload_text_attachment(item, index) for index, item in enumerate(attachments, start=1)]
-        self._bootstrap()
-        requirements = self._get_chat_requirements()
-        conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
-        response = self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort)
+        started_at = time.time()
+        response: requests.Response | None = None
+        for attempt in range(1, _text_attachment_submit_retries() + 1):
+            try:
+                response = self._open_text_attachment_conversation(prompt_text, attachments, model, effort)
+                break
+            except Exception as exc:
+                if not _is_retryable_connection_error(exc) or attempt >= _text_attachment_submit_retries():
+                    raise
+                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=5.0)
+                if recovered_id:
+                    result = self._wait_text_attachment_result(
+                        recovered_id,
+                        _text_attachment_timeout_secs(),
+                        _text_attachment_poll_interval_secs(),
+                    )
+                    if result.get("answer"):
+                        yield self._text_attachment_assistant_payload(result)
+                    yield "[DONE]"
+                    return
+                logger.warning({
+                    "event": "text_attachment_submit_retry",
+                    "attempt": attempt,
+                    "max_attempts": _text_attachment_submit_retries(),
+                    "error": str(exc)[:300],
+                })
+                self._rebuild_session()
+                time.sleep(min(2.0 * attempt, 10.0))
+        if response is None:
+            raise RuntimeError("failed to start file attachment conversation")
         conversation_id = ""
         stream_error: Exception | None = None
         try:
@@ -2867,14 +2998,26 @@ class OpenAIBackendAPI:
         if conversation_id:
             result = self._wait_text_attachment_result(
                 conversation_id,
-                TEXT_ATTACHMENT_TIMEOUT_SECS,
-                TEXT_ATTACHMENT_POLL_INTERVAL_SECS,
+                _text_attachment_timeout_secs(),
+                _text_attachment_poll_interval_secs(),
             )
             if result.get("answer"):
                 yield self._text_attachment_assistant_payload(result)
             yield "[DONE]"
             return
         if stream_error:
+            if _is_retryable_connection_error(stream_error):
+                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=5.0)
+                if recovered_id:
+                    result = self._wait_text_attachment_result(
+                        recovered_id,
+                        _text_attachment_timeout_secs(),
+                        _text_attachment_poll_interval_secs(),
+                    )
+                    if result.get("answer"):
+                        yield self._text_attachment_assistant_payload(result)
+                    yield "[DONE]"
+                    return
             raise stream_error
         yield "[DONE]"
 
