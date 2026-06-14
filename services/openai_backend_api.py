@@ -59,6 +59,7 @@ def _config_bool(key: str, default: bool) -> bool:
 
     paths.extend([
         Path("/app/config.json"),
+        Path(__file__).resolve().parents[1] / "config.json",
         Path("config.json"),
     ])
 
@@ -79,6 +80,16 @@ def _config_bool(key: str, default: bool) -> bool:
         pass
 
     return default
+
+
+def _history_and_training_disabled() -> bool:
+    return _config_bool("history_and_training_disabled", True)
+
+
+def _history_and_training_disabled_query() -> str:
+    return "true" if _history_and_training_disabled() else "false"
+
+
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
@@ -89,6 +100,9 @@ SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
+TEXT_ATTACHMENT_TIMEOUT_SECS = 300.0
+TEXT_ATTACHMENT_POLL_INTERVAL_SECS = 3.0
+TEXT_ATTACHMENT_PENDING_MARKERS = ("连接已中断", "等待完整回复")
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
 EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
 EDITABLE_FILE_THINKING_EFFORT = "extended"
@@ -515,7 +529,7 @@ class OpenAIBackendAPI:
             "force_paragen_model_slug": "",
             "force_rate_limit": False,
             "force_use_sse": True,
-            "history_and_training_disabled": _config_bool("history_and_training_disabled", True),
+            "history_and_training_disabled": _history_and_training_disabled(),
             "reset_rate_limits": False,
             "suggestions": [],
             "supported_encodings": [],
@@ -842,6 +856,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
+            "history_and_training_disabled": _history_and_training_disabled(),
             "system_hints": ["picture_v2"],
             "partial_query": {
                 "id": new_uuid(),
@@ -982,7 +997,7 @@ class OpenAIBackendAPI:
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
             "system_hints": ["picture_v2"],
-            "history_and_training_disabled": _config_bool("history_and_training_disabled", True),
+            "history_and_training_disabled": _history_and_training_disabled(),
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": {
@@ -1292,6 +1307,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
+            "history_and_training_disabled": _history_and_training_disabled(),
             "system_hints": [],
             "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
             "supports_buffering": True,
@@ -1360,6 +1376,7 @@ class OpenAIBackendAPI:
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
                 "conversation_mode": {"kind": "primary_assistant"},
+                "history_and_training_disabled": _history_and_training_disabled(),
                 "enable_message_followups": True,
                 "system_hints": [],
                 "supports_buffering": True,
@@ -1790,6 +1807,7 @@ class OpenAIBackendAPI:
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
                 "conversation_mode": {"kind": "primary_assistant"},
+                "history_and_training_disabled": _history_and_training_disabled(),
                 "system_hints": ["search"],
                 "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
                 "supports_buffering": True,
@@ -1831,6 +1849,7 @@ class OpenAIBackendAPI:
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
                 "conversation_mode": {"kind": "primary_assistant"},
+                "history_and_training_disabled": _history_and_training_disabled(),
                 "enable_message_followups": True,
                 "system_hints": [],
                 "supports_buffering": True,
@@ -1913,6 +1932,68 @@ class OpenAIBackendAPI:
             "assistant_message_id": str(message.get("id") or ""),
             "create_time": float(message.get("create_time") or 0.0),
         }
+
+    def _wait_text_attachment_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
+        deadline = time.time() + timeout_secs
+        last_result: Dict[str, Any] | None = None
+        last_answer = ""
+        stable_hits = 0
+        while time.time() < deadline:
+            try:
+                last_result = self._extract_text_attachment_result(conversation_id, self._get_search_conversation(conversation_id))
+            except UpstreamHTTPError as exc:
+                if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
+                    raise
+            if last_result and last_result.get("answer"):
+                if last_result.get("status") in SEARCH_DONE_STATUS:
+                    return last_result
+                answer = str(last_result.get("answer") or "")
+                stable_hits = stable_hits + 1 if answer == last_answer else 0
+                last_answer = answer
+                if stable_hits >= 2:
+                    return last_result
+            time.sleep(poll_interval_secs)
+        if last_result and last_result.get("answer"):
+            return last_result
+        raise RuntimeError(f"timed out waiting for text attachment result: {conversation_id}")
+
+    def _extract_text_attachment_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
+        messages = []
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            if ((message.get("author") or {}).get("role") or "") == "assistant":
+                messages.append(message)
+        message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
+        answer = self._search_message_text(message)
+        if self._is_text_attachment_pending_answer(answer):
+            answer = ""
+        return {
+            "conversation_id": conversation_id,
+            "status": str(finish_details.get("type") or metadata.get("status") or self._find_search_value(message, "status") or "").strip(),
+            "answer": answer,
+            "assistant_message_id": str(message.get("id") or ""),
+            "create_time": float(message.get("create_time") or 0.0),
+        }
+
+    @staticmethod
+    def _is_text_attachment_pending_answer(answer: str) -> bool:
+        value = str(answer or "").strip()
+        return bool(value and all(marker in value for marker in TEXT_ATTACHMENT_PENDING_MARKERS))
+
+    @staticmethod
+    def _text_attachment_assistant_payload(result: Dict[str, Any]) -> str:
+        return json.dumps({
+            "conversation_id": result.get("conversation_id") or "",
+            "message": {
+                "id": result.get("assistant_message_id") or new_uuid(),
+                "author": {"role": "assistant"},
+                "create_time": result.get("create_time") or time.time(),
+                "content": {"content_type": "text", "parts": [result.get("answer") or ""]},
+                "metadata": {"finish_details": {"type": result.get("status") or "finished_successfully"}},
+            },
+        }, ensure_ascii=False)
 
     def _extract_search_sources(self, payload: Any) -> list[Dict[str, str]]:
         sources: list[Dict[str, str]] = []
@@ -2655,6 +2736,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
+            "history_and_training_disabled": _history_and_training_disabled(),
             "system_hints": [],
             "partial_query": {
                 "id": new_uuid(),
@@ -2720,6 +2802,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
+            "history_and_training_disabled": _history_and_training_disabled(),
             "enable_message_followups": True,
             "system_hints": [],
             "supports_buffering": True,
@@ -2769,10 +2852,31 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
         response = self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort)
+        conversation_id = ""
+        stream_error: Exception | None = None
         try:
-            yield from iter_sse_payloads(response)
+            for payload in iter_sse_payloads(response):
+                conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
+                if payload == "[DONE]":
+                    break
+                yield payload
+        except Exception as exc:
+            stream_error = exc
         finally:
             response.close()
+        if conversation_id:
+            result = self._wait_text_attachment_result(
+                conversation_id,
+                TEXT_ATTACHMENT_TIMEOUT_SECS,
+                TEXT_ATTACHMENT_POLL_INTERVAL_SECS,
+            )
+            if result.get("answer"):
+                yield self._text_attachment_assistant_payload(result)
+            yield "[DONE]"
+            return
+        if stream_error:
+            raise stream_error
+        yield "[DONE]"
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
@@ -2887,7 +2991,7 @@ class OpenAIBackendAPI:
     def list_models(self) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""
         self._bootstrap()
-        path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
+        path = f"/backend-api/models?history_and_training_disabled={_history_and_training_disabled_query()}" if self.access_token else (
             "/backend-anon/models?iim=false&is_gizmo=false"
         )
         route = "/backend-api/models" if self.access_token else "/backend-anon/models"

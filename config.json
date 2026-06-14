@@ -5,7 +5,7 @@
   "image_poll_timeout_secs": 120,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,
-  "history_and_training_disabled": true
+  "history_and_training_disabled": true,
   "log_levels": [
     "debug",
     "error",

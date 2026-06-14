@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterable, Iterator
 from services.config import config
 
 CACHEABLE_TEXT_KEYS = {
+    "attachments",
     "frequency_penalty",
     "max_completion_tokens",
     "max_tokens",
@@ -22,6 +23,7 @@ CACHEABLE_TEXT_KEYS = {
     "seed",
     "stop",
     "temperature",
+    "thinking_effort",
     "tool_choice",
     "tools",
     "top_p",
