@@ -14,7 +14,7 @@ from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, unquote_to_bytes, urlparse
 
 from curl_cffi import requests
 from PIL import Image
@@ -2506,12 +2506,17 @@ class OpenAIBackendAPI:
             messages: Optional[list[Dict[str, Any]]] = None,
             model: str = "auto",
             prompt: str = "",
+            attachments: Optional[list[Dict[str, Any]]] = None,
+            thinking_effort: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
             yield from self._stream_picture_conversation(prompt, model, images or [])
+            return
+        if attachments:
+            yield from self._stream_text_attachment_conversation(messages or [], model, prompt, attachments, thinking_effort)
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2527,6 +2532,243 @@ class OpenAIBackendAPI:
             stream=True,
         )
         ensure_ok(response, path)
+        try:
+            yield from iter_sse_payloads(response)
+        finally:
+            response.close()
+
+    @staticmethod
+    def _plain_text_from_message_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and str(item.get("type") or "") in {"text", "input_text", "output_text"}:
+                    parts.append(str(item.get("text") or ""))
+            return "".join(parts)
+        return ""
+
+    @classmethod
+    def _prompt_from_messages(cls, messages: list[Dict[str, Any]], fallback: str = "") -> str:
+        if fallback.strip():
+            return fallback.strip()
+        parts: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "user").strip() or "user"
+            text = cls._plain_text_from_message_content(message.get("content")).strip()
+            if text:
+                parts.append(text if role == "user" else f"{role}: {text}")
+        return "\n\n".join(parts).strip()
+
+    @staticmethod
+    def _decode_text_attachment(item: Dict[str, Any], index: int) -> tuple[bytes, str, str]:
+        filename = str(item.get("filename") or item.get("file_name") or item.get("name") or f"attachment_{index}.md").strip()
+        if not filename:
+            filename = f"attachment_{index}.md"
+        mime_type = str(item.get("mime_type") or item.get("mimeType") or "").strip()
+        if not mime_type:
+            mime_type = mimetypes.guess_type(filename)[0] or "text/markdown"
+        raw_content = item.get("content")
+        if isinstance(raw_content, str):
+            return raw_content.encode("utf-8"), filename, mime_type
+        raw_data = item.get("base64") or item.get("data") or item.get("b64_json")
+        if isinstance(raw_data, str) and raw_data.strip():
+            raw = raw_data.strip()
+            match = re.match(r"^data:([^;,]+)(;base64)?,(.*)$", raw, re.IGNORECASE | re.DOTALL)
+            if match:
+                mime_type = str(match.group(1) or mime_type).strip() or mime_type
+                payload = str(match.group(3) or "")
+                data = base64.b64decode(payload) if match.group(2) else unquote_to_bytes(payload)
+            else:
+                data = base64.b64decode(raw)
+            return data, filename, mime_type
+        raise ValueError(f"attachment {filename} has no content or base64 data")
+
+    def _upload_text_attachment(self, item: Dict[str, Any], index: int) -> Dict[str, Any]:
+        data, file_name, mime_type = self._decode_text_attachment(item, index)
+        path = "/backend-api/files"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
+            json={
+                "file_name": file_name,
+                "file_size": len(data),
+                "use_case": "multimodal",
+                "timezone_offset_min": -480,
+                "reset_rate_limits": False,
+                "store_in_library": True,
+                "library_persistence_mode": "opportunistic",
+            },
+            timeout=60,
+        )
+        ensure_ok(response, path)
+        payload = response.json()
+        upload_url = str(payload.get("upload_url") or "")
+        file_id = str(payload.get("file_id") or "")
+        if not upload_url or not file_id:
+            raise RuntimeError(f"invalid upload response: {payload}")
+        response = self.session.put(
+            upload_url,
+            headers={
+                "Content-Type": mime_type,
+                "x-ms-blob-type": "BlockBlob",
+                "x-ms-version": "2020-04-08",
+                "Origin": self.base_url,
+                "Referer": self.base_url + "/",
+                "User-Agent": self.user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+            data=data,
+            timeout=120,
+        )
+        ensure_ok(response, "attachment_upload")
+        uploaded_path = f"/backend-api/files/{file_id}/uploaded"
+        response = self.session.post(
+            self.base_url + uploaded_path,
+            headers=self._headers(uploaded_path, {"Accept": "*/*", "Content-Type": "application/json"}),
+            data="{}",
+            timeout=60,
+        )
+        ensure_ok(response, uploaded_path)
+        return {
+            "file_id": file_id,
+            "library_file_id": str(payload.get("library_file_id") or ""),
+            "file_name": file_name,
+            "file_size": len(data),
+            "mime_type": mime_type,
+        }
+
+    def _prepare_text_attachment_conversation(self, prompt: str, attachment_mime_types: list[str], model: str, thinking_effort: str = "") -> str:
+        path = "/backend-api/f/conversation/prepare"
+        payload: Dict[str, Any] = {
+            "action": "next",
+            "fork_from_shared_post": False,
+            "parent_message_id": "client-created-root",
+            "model": model,
+            "client_prepare_state": "success",
+            "timezone_offset_min": -480,
+            "timezone": "Asia/Shanghai",
+            "conversation_mode": {"kind": "primary_assistant"},
+            "system_hints": [],
+            "partial_query": {
+                "id": new_uuid(),
+                "author": {"role": "user"},
+                "content": {"content_type": "text", "parts": [prompt]},
+            },
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "client_contextual_info": {"app_name": "chatgpt.com"},
+        }
+        if attachment_mime_types:
+            payload["attachment_mime_types"] = attachment_mime_types
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
+            json=payload,
+            timeout=60,
+        )
+        ensure_ok(response, path)
+        conduit_token = str(response.json().get("conduit_token") or "")
+        if not conduit_token:
+            raise RuntimeError(f"missing conduit_token: {response.text}")
+        return conduit_token
+
+    def _start_text_attachment_conversation(
+            self,
+            prompt: str,
+            uploaded: list[Dict[str, Any]],
+            requirements: ChatRequirements,
+            conduit_token: str,
+            model: str,
+            thinking_effort: str = "",
+    ) -> requests.Response:
+        metadata: Dict[str, Any] = {
+            "attachments": [{
+                "id": item["file_id"],
+                "size": item["file_size"],
+                "name": item["file_name"],
+                "mime_type": item["mime_type"],
+                "source": "local",
+                "library_file_id": item["library_file_id"],
+                "is_big_paste": False,
+            } for item in uploaded],
+            "selected_sources": [],
+            "selected_github_repos": [],
+            "selected_all_github_repos": False,
+            "serialization_metadata": {"custom_symbol_offsets": []},
+        }
+        payload: Dict[str, Any] = {
+            "action": "next",
+            "messages": [{
+                "id": new_uuid(),
+                "author": {"role": "user"},
+                "create_time": time.time(),
+                "content": {"content_type": "text", "parts": [prompt]},
+                "metadata": metadata,
+            }],
+            "parent_message_id": "client-created-root",
+            "model": model,
+            "client_prepare_state": "success",
+            "timezone_offset_min": -480,
+            "timezone": "Asia/Shanghai",
+            "conversation_mode": {"kind": "primary_assistant"},
+            "enable_message_followups": True,
+            "system_hints": [],
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "client_contextual_info": {
+                "is_dark_mode": False,
+                "time_since_loaded": 1200,
+                "page_height": 900,
+                "page_width": 1400,
+                "pixel_ratio": 1.25,
+                "screen_height": 960,
+                "screen_width": 1536,
+                "app_name": "chatgpt.com",
+            },
+            "paragen_cot_summary_display_override": "allow",
+            "force_parallel_switch": "auto",
+        }
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
+        path = "/backend-api/f/conversation"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            json=payload,
+            timeout=300,
+            stream=True,
+        )
+        ensure_ok(response, path)
+        return response
+
+    def _stream_text_attachment_conversation(
+            self,
+            messages: list[Dict[str, Any]],
+            model: str,
+            prompt: str,
+            attachments: list[Dict[str, Any]],
+            thinking_effort: str = "",
+    ) -> Iterator[str]:
+        if not self.access_token:
+            raise RuntimeError("access_token is required for file attachment conversation")
+        prompt_text = self._prompt_from_messages(messages, prompt)
+        if not prompt_text:
+            raise RuntimeError("prompt is required for file attachment conversation")
+        effort = thinking_effort or ("extended" if "thinking" in model.lower() else "")
+        uploaded = [self._upload_text_attachment(item, index) for index, item in enumerate(attachments, start=1)]
+        self._bootstrap()
+        requirements = self._get_chat_requirements()
+        conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
+        response = self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort)
         try:
             yield from iter_sse_payloads(response)
         finally:
