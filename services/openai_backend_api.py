@@ -4,7 +4,6 @@ import mimetypes
 import os
 import random
 import re
-import threading
 import time
 
 import urllib.error
@@ -3196,16 +3195,6 @@ class OpenAIBackendAPI:
         conversation_id = ""
         stream_text = ""
         stream_error: Exception | None = None
-        drain_in_background = False
-
-        def drain_remaining_stream() -> None:
-            try:
-                for _ in iter_sse_payloads(response):
-                    pass
-            except Exception:
-                pass
-            finally:
-                response.close()
 
         try:
             for payload in iter_sse_payloads(response):
@@ -3214,16 +3203,10 @@ class OpenAIBackendAPI:
                 conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 stream_text = self._text_attachment_stream_text(payload, stream_text)
                 yield payload
-                if require_json and self._is_text_attachment_complete_json_answer(stream_text):
-                    drain_in_background = True
-                    threading.Thread(target=drain_remaining_stream, name="text-attachment-stream-drain", daemon=True).start()
-                    yield "[DONE]"
-                    return
         except Exception as exc:
             stream_error = exc
         finally:
-            if not drain_in_background:
-                response.close()
+            response.close()
 
         has_stream_answer = bool(stream_text.strip()) and not self._is_text_attachment_pending_answer(stream_text)
         has_stream_json = self._is_text_attachment_complete_json_answer(stream_text)
