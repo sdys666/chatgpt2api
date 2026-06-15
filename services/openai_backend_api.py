@@ -2018,8 +2018,6 @@ class OpenAIBackendAPI:
     def _wait_text_attachment_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
         deadline = time.time() + timeout_secs
         last_result: Dict[str, Any] | None = None
-        last_answer = ""
-        stable_hits = 0
         retryable_errors = 0
         while time.time() < deadline:
             try:
@@ -2039,11 +2037,6 @@ class OpenAIBackendAPI:
                 })
             if last_result and last_result.get("answer"):
                 if last_result.get("status") in SEARCH_DONE_STATUS:
-                    return last_result
-                answer = str(last_result.get("answer") or "")
-                stable_hits = stable_hits + 1 if answer == last_answer else 0
-                last_answer = answer
-                if stable_hits >= 2:
                     return last_result
             time.sleep(poll_interval_secs)
         if last_result and last_result.get("answer"):
@@ -2996,7 +2989,9 @@ class OpenAIBackendAPI:
                 conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 if payload == "[DONE]":
                     break
-                yield payload
+                # Attachment conversations often stream draft/progress text before
+                # ChatGPT finishes the real answer. Keep polling the conversation
+                # detail and only emit the final assistant message to API clients.
         except Exception as exc:
             stream_error = exc
         finally:

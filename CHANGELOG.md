@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [修复] 附件文字聊天不再把 ChatGPT 的中间过程流直接返回给 API 客户端；会持续轮询会话详情直到最终 assistant 消息完成，避免 thinking 模式下把“连接已中断/等待完整回复”前的过程文字误判为成功结果。
+
 ## 1.5.0 - 2026-06-13
 
 + [新增] 新增 WARP / Privoxy / FlareSolverr 清障方案，注册遇到 Cloudflare 拦截后可刷新 clearance 并重试。
