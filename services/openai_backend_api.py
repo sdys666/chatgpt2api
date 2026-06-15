@@ -159,6 +159,10 @@ def _text_attachment_submit_retries() -> int:
     return _config_int("text_attachment_submit_retries", 3, 1, 10)
 
 
+def _is_json_response_format(response_format: str) -> bool:
+    return str(response_format or "").strip().lower() in {"json", "json_object"}
+
+
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
@@ -2015,7 +2019,7 @@ class OpenAIBackendAPI:
             "create_time": float(message.get("create_time") or 0.0),
         }
 
-    def _wait_text_attachment_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
+    def _wait_text_attachment_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float, require_json: bool = False) -> Dict[str, Any]:
         deadline = time.time() + timeout_secs
         last_result: Dict[str, Any] | None = None
         last_answer = ""
@@ -2051,10 +2055,11 @@ class OpenAIBackendAPI:
                 })
             if last_result and last_result.get("answer"):
                 retryable_errors = 0
-                if last_result.get("status") in SEARCH_DONE_STATUS:
-                    return last_result
                 answer = str(last_result.get("answer") or "")
-                if self._is_text_attachment_complete_json_answer(answer):
+                is_json_answer = self._is_text_attachment_complete_json_answer(answer)
+                if last_result.get("status") in SEARCH_DONE_STATUS and (not require_json or is_json_answer):
+                    return last_result
+                if is_json_answer:
                     stable_json_hits = stable_json_hits + 1 if answer == last_answer else 1
                     last_answer = answer
                     if stable_json_hits >= 2:
@@ -2068,7 +2073,7 @@ class OpenAIBackendAPI:
                     stable_json_hits = 0
                     last_answer = answer
             time.sleep(next_sleep)
-        if last_result and last_result.get("answer"):
+        if last_result and last_result.get("answer") and (not require_json or self._is_text_attachment_complete_json_answer(str(last_result.get("answer") or ""))):
             return last_result
         raise RuntimeError(f"timed out waiting for text attachment result: {conversation_id}")
 
@@ -2734,6 +2739,7 @@ class OpenAIBackendAPI:
             prompt: str = "",
             attachments: Optional[list[Dict[str, Any]]] = None,
             thinking_effort: str = "",
+            response_format: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
     ) -> Iterator[str]:
@@ -2742,7 +2748,7 @@ class OpenAIBackendAPI:
             yield from self._stream_picture_conversation(prompt, model, images or [])
             return
         if attachments:
-            yield from self._stream_text_attachment_conversation(messages or [], model, prompt, attachments, thinking_effort)
+            yield from self._stream_text_attachment_conversation(messages or [], model, prompt, attachments, thinking_effort, _is_json_response_format(response_format))
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2998,6 +3004,7 @@ class OpenAIBackendAPI:
             prompt: str,
             attachments: list[Dict[str, Any]],
             thinking_effort: str = "",
+            require_json: bool = False,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for file attachment conversation")
@@ -3020,6 +3027,7 @@ class OpenAIBackendAPI:
                         recovered_id,
                         _text_attachment_timeout_secs(),
                         _text_attachment_poll_interval_secs(),
+                        require_json=require_json,
                     )
                     if result.get("answer"):
                         yield self._text_attachment_assistant_payload(result)
@@ -3054,6 +3062,7 @@ class OpenAIBackendAPI:
                 conversation_id,
                 _text_attachment_timeout_secs(),
                 _text_attachment_poll_interval_secs(),
+                require_json=require_json,
             )
             if result.get("answer"):
                 yield self._text_attachment_assistant_payload(result)
@@ -3065,6 +3074,7 @@ class OpenAIBackendAPI:
                 recovered_id,
                 _text_attachment_timeout_secs(),
                 _text_attachment_poll_interval_secs(),
+                require_json=require_json,
             )
             if result.get("answer"):
                 yield self._text_attachment_assistant_payload(result)
@@ -3078,13 +3088,14 @@ class OpenAIBackendAPI:
                         recovered_id,
                         _text_attachment_timeout_secs(),
                         _text_attachment_poll_interval_secs(),
+                        require_json=require_json,
                     )
                     if result.get("answer"):
                         yield self._text_attachment_assistant_payload(result)
                     yield "[DONE]"
                     return
             raise stream_error
-        yield "[DONE]"
+        raise RuntimeError("conversation_id not found in text attachment stream")
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
