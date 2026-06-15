@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import time
+import queue
+import threading
 import uuid
 from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
+from services.config import config
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
@@ -42,6 +45,17 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
+
+
+_DONE = object()
+
+
+def _text_attachment_heartbeat_secs() -> float:
+    try:
+        value = float(config.data.get("text_attachment_stream_heartbeat_secs") or config.data.get("text_attachment_poll_interval_secs") or 10.0)
+    except (TypeError, ValueError):
+        value = 10.0
+    return min(max(value, 1.0), 60.0)
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -101,7 +115,11 @@ def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: 
     created = int(time.time())
     sent_role = False
     request = ConversationRequest(model=model, messages=messages, attachments=attachments, thinking_effort=thinking_effort)
-    for delta_text in stream_text_deltas(backend, request):
+    if attachments:
+        sent_role = True
+        yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
+    delta_source = _stream_text_deltas_with_heartbeat(backend, request) if attachments else stream_text_deltas(backend, request)
+    for delta_text in delta_source:
         if not sent_role:
             sent_role = True
             yield completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
@@ -110,6 +128,31 @@ def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: 
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)
+
+
+def _stream_text_deltas_with_heartbeat(backend, request: ConversationRequest) -> Iterator[str]:
+    items: queue.Queue[object] = queue.Queue()
+
+    def worker() -> None:
+        try:
+            for delta in stream_text_deltas(backend, request):
+                items.put(delta)
+            items.put(_DONE)
+        except Exception as exc:
+            items.put(exc)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while True:
+        try:
+            item = items.get(timeout=_text_attachment_heartbeat_secs())
+        except queue.Empty:
+            yield ""
+            continue
+        if item is _DONE:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield str(item)
 
 
 def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:

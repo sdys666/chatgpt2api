@@ -152,7 +152,7 @@ def _text_attachment_request_timeout_secs() -> float:
 
 
 def _text_attachment_poll_interval_secs() -> float:
-    return _config_float("text_attachment_poll_interval_secs", 3.0, 1.0, 60.0)
+    return _config_float("text_attachment_poll_interval_secs", 10.0, 1.0, 60.0)
 
 
 def _text_attachment_submit_retries() -> int:
@@ -2022,22 +2022,35 @@ class OpenAIBackendAPI:
         stable_json_hits = 0
         retryable_errors = 0
         while time.time() < deadline:
+            next_sleep = poll_interval_secs
             try:
                 last_result = self._extract_text_attachment_result(conversation_id, self._get_search_conversation(conversation_id))
             except UpstreamHTTPError as exc:
                 if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
                     raise
+                retryable_errors += 1
+                if exc.status_code == 429:
+                    next_sleep = min(max(poll_interval_secs, 10.0) * retryable_errors, 60.0)
+                    logger.warning({
+                        "event": "text_attachment_poll_rate_limited",
+                        "conversation_id": conversation_id,
+                        "retryable_errors": retryable_errors,
+                        "sleep_secs": round(next_sleep, 1),
+                    })
             except Exception as exc:
                 if not _is_retryable_connection_error(exc):
                     raise
                 retryable_errors += 1
+                next_sleep = min(max(poll_interval_secs, 5.0) * retryable_errors, 30.0)
                 logger.warning({
                     "event": "text_attachment_poll_retryable_error",
                     "conversation_id": conversation_id,
                     "retryable_errors": retryable_errors,
+                    "sleep_secs": round(next_sleep, 1),
                     "error": str(exc)[:300],
                 })
             if last_result and last_result.get("answer"):
+                retryable_errors = 0
                 if last_result.get("status") in SEARCH_DONE_STATUS:
                     return last_result
                 answer = str(last_result.get("answer") or "")
@@ -2054,7 +2067,7 @@ class OpenAIBackendAPI:
                 else:
                     stable_json_hits = 0
                     last_answer = answer
-            time.sleep(poll_interval_secs)
+            time.sleep(next_sleep)
         if last_result and last_result.get("answer"):
             return last_result
         raise RuntimeError(f"timed out waiting for text attachment result: {conversation_id}")
