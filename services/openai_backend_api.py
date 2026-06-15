@@ -155,6 +155,14 @@ def _text_attachment_poll_interval_secs() -> float:
     return _config_float("text_attachment_poll_interval_secs", 10.0, 1.0, 60.0)
 
 
+def _text_attachment_poll_initial_wait_secs() -> float:
+    return _config_float("text_attachment_poll_initial_wait_secs", 15.0, 0.0, 120.0)
+
+
+def _text_attachment_recovery_timeout_secs() -> float:
+    return _config_float("text_attachment_recovery_timeout_secs", 120.0, 10.0, 600.0)
+
+
 def _text_attachment_submit_retries() -> int:
     return _config_int("text_attachment_submit_retries", 3, 1, 10)
 
@@ -2020,41 +2028,99 @@ class OpenAIBackendAPI:
         }
 
     def _wait_text_attachment_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float, require_json: bool = False) -> Dict[str, Any]:
-        deadline = time.time() + timeout_secs
+        start = time.time()
         last_result: Dict[str, Any] | None = None
         last_answer = ""
         stable_json_hits = 0
-        retryable_errors = 0
-        while time.time() < deadline:
-            next_sleep = poll_interval_secs
+        attempt = 0
+        interval = float(poll_interval_secs)
+        initial_wait = _text_attachment_poll_initial_wait_secs()
+        last_task_error = ""
+        logger.info({
+            "event": "text_attachment_poll_start",
+            "conversation_id": conversation_id,
+            "timeout_secs": timeout_secs,
+            "initial_wait_secs": initial_wait,
+            "interval_secs": interval,
+            "require_json": require_json,
+        })
+
+        def _remaining() -> float:
+            return timeout_secs - (time.time() - start)
+
+        if initial_wait > 0:
+            jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
+            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+        def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
+            base = retry_after if retry_after is not None else min(2 ** min(attempt, 4), 16)
+            backoff = base + random.uniform(0, 0.5)
+            remaining = _remaining()
+            if remaining <= 0:
+                return False
+            sleep_for = min(backoff, remaining)
+            log_payload: Dict[str, Any] = {
+                "event": "text_attachment_poll_retry",
+                "conversation_id": conversation_id,
+                "attempt": attempt,
+                "reason": reason,
+                "sleep_secs": round(sleep_for, 2),
+            }
+            if status_code is not None:
+                log_payload["status_code"] = status_code
+            if error is not None:
+                log_payload["error"] = error
+            logger.warning(log_payload)
+            time.sleep(sleep_for)
+            return True
+
+        while _remaining() > 0:
+            attempt += 1
+            last_task_error = ""
             try:
-                last_result = self._extract_text_attachment_result(conversation_id, self._get_search_conversation(conversation_id))
+                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                for task in tasks:
+                    is_error, error_msg, metadata = self.check_task_error(task)
+                    if is_error and error_msg:
+                        last_task_error = error_msg
+                        logger.info({
+                            "event": "text_attachment_poll_task_error_not_blocking",
+                            "conversation_id": conversation_id,
+                            "attempt": attempt,
+                            "error_msg": error_msg,
+                            "metadata": metadata,
+                        })
+            except Exception as exc:
+                logger.debug({
+                    "event": "text_attachment_poll_task_check_failed",
+                    "conversation_id": conversation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                })
+
+            try:
+                conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
-                if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
-                    raise
-                retryable_errors += 1
-                if exc.status_code == 429:
-                    next_sleep = min(max(poll_interval_secs, 10.0) * retryable_errors, 60.0)
-                    logger.warning({
-                        "event": "text_attachment_poll_rate_limited",
-                        "conversation_id": conversation_id,
-                        "retryable_errors": retryable_errors,
-                        "sleep_secs": round(next_sleep, 1),
-                    })
+                if exc.status_code in (429, 500, 502, 503, 504):
+                    if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
+                        continue
+                    break
+                raise
+            except requests.exceptions.RequestException as exc:
+                if _retry_sleep("network", None, str(exc), None):
+                    continue
+                break
             except Exception as exc:
                 if not _is_retryable_connection_error(exc):
                     raise
-                retryable_errors += 1
-                next_sleep = min(max(poll_interval_secs, 5.0) * retryable_errors, 30.0)
-                logger.warning({
-                    "event": "text_attachment_poll_retryable_error",
-                    "conversation_id": conversation_id,
-                    "retryable_errors": retryable_errors,
-                    "sleep_secs": round(next_sleep, 1),
-                    "error": str(exc)[:300],
-                })
+                if _retry_sleep("network", None, str(exc), None):
+                    continue
+                break
+
+            last_result = self._extract_text_attachment_result(conversation_id, conversation)
             if last_result and last_result.get("answer"):
-                retryable_errors = 0
                 answer = str(last_result.get("answer") or "")
                 is_json_answer = self._is_text_attachment_complete_json_answer(answer)
                 if last_result.get("status") in SEARCH_DONE_STATUS and (not require_json or is_json_answer):
@@ -2072,9 +2138,24 @@ class OpenAIBackendAPI:
                 else:
                     stable_json_hits = 0
                     last_answer = answer
-            time.sleep(next_sleep)
+            logger.debug({
+                "event": "text_attachment_poll_wait",
+                "conversation_id": conversation_id,
+                "elapsed_secs": round(time.time() - start, 1),
+            })
+            sleep_for = min(interval, max(0.0, _remaining()))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
         if last_result and last_result.get("answer") and (not require_json or self._is_text_attachment_complete_json_answer(str(last_result.get("answer") or ""))):
             return last_result
+        logger.info({
+            "event": "text_attachment_poll_timeout",
+            "conversation_id": conversation_id,
+            "timeout_secs": timeout_secs,
+            "attempts_made": attempt,
+            "initial_wait_exhausted_budget": attempt == 0,
+            "last_task_error": last_task_error if last_task_error else None,
+        })
         raise RuntimeError(f"timed out waiting for text attachment result: {conversation_id}")
 
     def _extract_text_attachment_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
@@ -3021,7 +3102,7 @@ class OpenAIBackendAPI:
             except Exception as exc:
                 if not _is_retryable_connection_error(exc) or attempt >= _text_attachment_submit_retries():
                     raise
-                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=15.0)
+                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=_text_attachment_recovery_timeout_secs())
                 if recovered_id:
                     result = self._wait_text_attachment_result(
                         recovered_id,
@@ -3068,7 +3149,7 @@ class OpenAIBackendAPI:
                 yield self._text_attachment_assistant_payload(result)
             yield "[DONE]"
             return
-        recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=15.0)
+        recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=_text_attachment_recovery_timeout_secs())
         if recovered_id:
             result = self._wait_text_attachment_result(
                 recovered_id,
@@ -3082,7 +3163,7 @@ class OpenAIBackendAPI:
             return
         if stream_error:
             if _is_retryable_connection_error(stream_error):
-                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=15.0)
+                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=_text_attachment_recovery_timeout_secs())
                 if recovered_id:
                     result = self._wait_text_attachment_result(
                         recovered_id,
