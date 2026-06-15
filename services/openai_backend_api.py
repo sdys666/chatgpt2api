@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -114,6 +115,31 @@ def _config_float(key: str, default: float, min_value: float | None = None, max_
 def _config_int(key: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     value = int(_config_float(key, float(default), float(min_value) if min_value is not None else None, float(max_value) if max_value is not None else None))
     return value
+
+
+def _timestamp(value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        pass
+    iso_text = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return default
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _history_and_training_disabled() -> bool:
@@ -1174,7 +1200,7 @@ class OpenAIBackendAPI:
             if not conv_id:
                 continue
             # 检查时间范围：对话的 updated_at 应该在请求开始时间之后（或附近）
-            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
+            updated_at = _timestamp(item.get("update_time") or item.get("updated_at"))
             if updated_at and started_at and (updated_at < started_at - 30 or updated_at > started_at + 600):
                 continue
             # 匹配 prompt 关键词
@@ -1204,7 +1230,7 @@ class OpenAIBackendAPI:
         # 如果没有标题匹配，返回最新的对话（时间最近的）
         for item in items:
             conv_id = str(item.get("id") or item.get("conversation_id") or "")
-            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
+            updated_at = _timestamp(item.get("update_time") or item.get("updated_at"))
             if conv_id and updated_at and started_at and updated_at >= started_at - 30:
                 logger.info({
                     "event": "conversation_latest_match",
@@ -1554,13 +1580,13 @@ class OpenAIBackendAPI:
 
     def _extract_editable_artifacts(self, conversation: Dict[str, Any], export_file_re: re.Pattern[str]) -> list[EditableFileArtifact]:
         artifacts: dict[str, EditableFileArtifact] = {}
-        for node in sorted((conversation.get("mapping") or {}).values(), key=lambda item: float(((item or {}).get("message") or {}).get("create_time") or 0.0)):
+        for node in sorted((conversation.get("mapping") or {}).values(), key=lambda item: _timestamp(((item or {}).get("message") or {}).get("create_time"))):
             message = (node or {}).get("message") or {}
             message_id = str(message.get("id") or "")
             author_role = str(((message.get("author") or {}).get("role") or "")).strip()
             if author_role not in {"assistant", "tool"}:
                 continue
-            create_time = float(message.get("create_time") or 0.0)
+            create_time = _timestamp(message.get("create_time"))
             message_text = self._editable_message_text(message)
             for artifact in self._extract_editable_message_artifacts(message, message_id, author_role, create_time, export_file_re):
                 key = artifact.attachment_id or artifact.file_id or artifact.name or artifact.sandbox_path
@@ -2009,7 +2035,7 @@ class OpenAIBackendAPI:
             message = (node or {}).get("message") or {}
             if ((message.get("author") or {}).get("role") or "") == "assistant":
                 messages.append(message)
-        message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
+        message = max(messages, key=lambda item: _timestamp(item.get("create_time"))) if messages else {}
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
         answer = self._search_message_text(message)
@@ -2024,7 +2050,7 @@ class OpenAIBackendAPI:
             "answer": answer,
             "sources": sources,
             "assistant_message_id": str(message.get("id") or ""),
-            "create_time": float(message.get("create_time") or 0.0),
+            "create_time": _timestamp(message.get("create_time")),
         }
 
     def _wait_text_attachment_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float, require_json: bool = False) -> Dict[str, Any]:
@@ -2140,7 +2166,7 @@ class OpenAIBackendAPI:
             message = (node or {}).get("message") or {}
             if ((message.get("author") or {}).get("role") or "") == "assistant":
                 messages.append(message)
-        sorted_messages = sorted(messages, key=lambda item: float(item.get("create_time") or 0.0), reverse=True)
+        sorted_messages = sorted(messages, key=lambda item: _timestamp(item.get("create_time")), reverse=True)
         message = sorted_messages[0] if sorted_messages else {}
         json_message: Dict[str, Any] | None = None
         text_message: Dict[str, Any] | None = None
@@ -2165,7 +2191,7 @@ class OpenAIBackendAPI:
             "status": str(finish_details.get("type") or metadata.get("status") or self._find_search_value(message, "status") or "").strip(),
             "answer": answer,
             "assistant_message_id": str(message.get("id") or ""),
-            "create_time": float(message.get("create_time") or 0.0),
+            "create_time": _timestamp(message.get("create_time")),
         }
 
     @staticmethod
