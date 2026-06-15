@@ -2056,7 +2056,13 @@ class OpenAIBackendAPI:
             message = (node or {}).get("message") or {}
             if ((message.get("author") or {}).get("role") or "") == "assistant":
                 messages.append(message)
-        message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
+        sorted_messages = sorted(messages, key=lambda item: float(item.get("create_time") or 0.0), reverse=True)
+        message = sorted_messages[0] if sorted_messages else {}
+        for candidate in sorted_messages:
+            candidate_answer = self._search_message_text(candidate)
+            if candidate_answer and not self._is_text_attachment_pending_answer(candidate_answer):
+                message = candidate
+                break
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
         answer = self._search_message_text(message)
@@ -2962,7 +2968,7 @@ class OpenAIBackendAPI:
             except Exception as exc:
                 if not _is_retryable_connection_error(exc) or attempt >= _text_attachment_submit_retries():
                     raise
-                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=5.0)
+                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=15.0)
                 if recovered_id:
                     result = self._wait_text_attachment_result(
                         recovered_id,
@@ -3005,9 +3011,20 @@ class OpenAIBackendAPI:
                 yield self._text_attachment_assistant_payload(result)
             yield "[DONE]"
             return
+        recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=15.0)
+        if recovered_id:
+            result = self._wait_text_attachment_result(
+                recovered_id,
+                _text_attachment_timeout_secs(),
+                _text_attachment_poll_interval_secs(),
+            )
+            if result.get("answer"):
+                yield self._text_attachment_assistant_payload(result)
+            yield "[DONE]"
+            return
         if stream_error:
             if _is_retryable_connection_error(stream_error):
-                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=5.0)
+                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=15.0)
                 if recovered_id:
                     result = self._wait_text_attachment_result(
                         recovered_id,
