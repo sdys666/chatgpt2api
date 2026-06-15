@@ -4,6 +4,7 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -3124,31 +3125,51 @@ class OpenAIBackendAPI:
                 time.sleep(min(2.0 * attempt, 10.0))
         if response is None:
             raise RuntimeError("failed to start file attachment conversation")
-        conversation_id = ""
-        stream_error: Exception | None = None
-        try:
-            for payload in iter_sse_payloads(response):
-                conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
-                if payload == "[DONE]":
-                    break
-                # Attachment conversations often stream draft/progress text before
-                # ChatGPT finishes the real answer. Keep polling the conversation
-                # detail and only emit the final assistant message to API clients.
-        except Exception as exc:
-            stream_error = exc
-        finally:
-            response.close()
+        stream_state: Dict[str, Any] = {"conversation_id": "", "error": None}
+        stream_ready = threading.Event()
+        stream_done = threading.Event()
+
+        def drain_stream() -> None:
+            try:
+                for payload in iter_sse_payloads(response):
+                    if payload != "[DONE]":
+                        found_id = self._find_search_value(payload, "conversation_id")
+                        if found_id and not stream_state["conversation_id"]:
+                            stream_state["conversation_id"] = found_id
+                            stream_ready.set()
+                    if payload == "[DONE]":
+                        break
+                    # Attachment conversations often stream draft/progress text before
+                    # ChatGPT finishes the real answer. Keep polling the conversation
+                    # detail and only emit the final assistant message to API clients.
+            except Exception as exc:
+                stream_state["error"] = exc
+            finally:
+                stream_done.set()
+                stream_ready.set()
+                response.close()
+
+        threading.Thread(target=drain_stream, name="text-attachment-stream-drain", daemon=True).start()
+        stream_wait_deadline = time.time() + min(30.0, _text_attachment_recovery_timeout_secs())
+        while not stream_state["conversation_id"] and not stream_done.is_set() and time.time() < stream_wait_deadline:
+            stream_ready.wait(min(1.0, max(0.0, stream_wait_deadline - time.time())))
+
+        conversation_id = str(stream_state["conversation_id"] or "")
+        stream_error = stream_state["error"] if isinstance(stream_state["error"], Exception) else None
         if conversation_id:
-            result = self._wait_text_attachment_result(
-                conversation_id,
-                _text_attachment_timeout_secs(),
-                _text_attachment_poll_interval_secs(),
-                require_json=require_json,
-            )
-            if result.get("answer"):
-                yield self._text_attachment_assistant_payload(result)
-            yield "[DONE]"
-            return
+            try:
+                result = self._wait_text_attachment_result(
+                    conversation_id,
+                    _text_attachment_timeout_secs(),
+                    _text_attachment_poll_interval_secs(),
+                    require_json=require_json,
+                )
+                if result.get("answer"):
+                    yield self._text_attachment_assistant_payload(result)
+                yield "[DONE]"
+                return
+            finally:
+                response.close()
         recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=_text_attachment_recovery_timeout_secs())
         if recovered_id:
             result = self._wait_text_attachment_result(
