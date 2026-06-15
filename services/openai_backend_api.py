@@ -2036,7 +2036,6 @@ class OpenAIBackendAPI:
         attempt = 0
         interval = float(poll_interval_secs)
         initial_wait = _text_attachment_poll_initial_wait_secs()
-        last_task_error = ""
         logger.info({
             "event": "text_attachment_poll_start",
             "conversation_id": conversation_id,
@@ -2079,28 +2078,6 @@ class OpenAIBackendAPI:
 
         while _remaining() > 0:
             attempt += 1
-            last_task_error = ""
-            try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
-                for task in tasks:
-                    is_error, error_msg, metadata = self.check_task_error(task)
-                    if is_error and error_msg:
-                        last_task_error = error_msg
-                        logger.info({
-                            "event": "text_attachment_poll_task_error_not_blocking",
-                            "conversation_id": conversation_id,
-                            "attempt": attempt,
-                            "error_msg": error_msg,
-                            "metadata": metadata,
-                        })
-            except Exception as exc:
-                logger.debug({
-                    "event": "text_attachment_poll_task_check_failed",
-                    "conversation_id": conversation_id,
-                    "attempt": attempt,
-                    "error": str(exc),
-                })
-
             try:
                 conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
@@ -2155,7 +2132,6 @@ class OpenAIBackendAPI:
             "timeout_secs": timeout_secs,
             "attempts_made": attempt,
             "initial_wait_exhausted_budget": attempt == 0,
-            "last_task_error": last_task_error if last_task_error else None,
         })
         raise RuntimeError(f"timed out waiting for text attachment result: {conversation_id}")
 
@@ -3111,6 +3087,66 @@ class OpenAIBackendAPI:
         conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
         return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort)
 
+    def _text_attachment_stream_text(self, payload: str, current_text: str) -> str:
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            return current_text
+        if not isinstance(event, dict):
+            return current_text
+        direct_text = self._text_attachment_event_assistant_text(event)
+        if direct_text:
+            return direct_text
+        return self._text_attachment_apply_text_patch(event, current_text)
+
+    def _text_attachment_event_assistant_text(self, event: Dict[str, Any]) -> str:
+        for candidate in (event, event.get("v")):
+            if not isinstance(candidate, dict):
+                continue
+            message = candidate.get("message")
+            if not isinstance(message, dict):
+                continue
+            role = str((message.get("author") or {}).get("role") or "").strip().lower()
+            if role != "assistant":
+                continue
+            text = self._search_message_text(message)
+            if text:
+                return text
+        return ""
+
+    def _text_attachment_apply_text_patch(self, event: Dict[str, Any], current_text: str) -> str:
+        if event.get("p") == "/message/content/parts/0":
+            return self._text_attachment_apply_patch_op(event, current_text)
+
+        operations = event.get("v")
+        if isinstance(operations, str) and current_text and not event.get("p") and not event.get("o"):
+            return current_text + operations
+
+        if event.get("o") == "patch" and isinstance(operations, list):
+            text = current_text
+            for item in operations:
+                if isinstance(item, dict):
+                    text = self._text_attachment_apply_text_patch(item, text)
+            return text
+
+        if isinstance(operations, list):
+            text = current_text
+            for item in operations:
+                if isinstance(item, dict):
+                    text = self._text_attachment_apply_text_patch(item, text)
+            return text
+        return current_text
+
+    @staticmethod
+    def _text_attachment_apply_patch_op(operation: Dict[str, Any], current_text: str) -> str:
+        op = operation.get("o")
+        value = str(operation.get("v") or "")
+        if op == "append":
+            return current_text + value
+        if op == "replace":
+            return value
+        return current_text
+
     def _stream_text_attachment_conversation(
             self,
             messages: list[Dict[str, Any]],
@@ -3157,56 +3193,66 @@ class OpenAIBackendAPI:
                 time.sleep(min(2.0 * attempt, 10.0))
         if response is None:
             raise RuntimeError("failed to start file attachment conversation")
-        stream_state: Dict[str, Any] = {"conversation_id": "", "error": None}
-        stream_ready = threading.Event()
-        stream_done = threading.Event()
+        conversation_id = ""
+        stream_text = ""
+        stream_error: Exception | None = None
+        drain_in_background = False
 
-        def drain_stream() -> None:
+        def drain_remaining_stream() -> None:
             try:
-                for payload in iter_sse_payloads(response):
-                    if payload != "[DONE]":
-                        found_id = self._find_search_value(payload, "conversation_id")
-                        if found_id and not stream_state["conversation_id"]:
-                            stream_state["conversation_id"] = found_id
-                            stream_ready.set()
-                    if payload == "[DONE]":
-                        break
-                    # Attachment conversations often stream draft/progress text before
-                    # ChatGPT finishes the real answer. Keep polling the conversation
-                    # detail and only emit the final assistant message to API clients.
-            except Exception as exc:
-                stream_state["error"] = exc
+                for _ in iter_sse_payloads(response):
+                    pass
+            except Exception:
+                pass
             finally:
-                stream_done.set()
-                stream_ready.set()
                 response.close()
 
-        threading.Thread(target=drain_stream, name="text-attachment-stream-drain", daemon=True).start()
-        stream_wait_deadline = time.time() + min(30.0, _text_attachment_recovery_timeout_secs())
-        next_recovery_at = time.time() + 3.0
-        while not stream_state["conversation_id"] and not stream_done.is_set() and time.time() < stream_wait_deadline:
-            stream_ready.wait(min(1.0, max(0.0, stream_wait_deadline - time.time())))
-            if stream_state["conversation_id"] or time.time() < next_recovery_at:
-                continue
-            recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=5.0)
-            if recovered_id:
-                stream_state["conversation_id"] = recovered_id
-                break
-            next_recovery_at = time.time() + 5.0
+        try:
+            for payload in iter_sse_payloads(response):
+                if payload == "[DONE]":
+                    break
+                conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
+                stream_text = self._text_attachment_stream_text(payload, stream_text)
+                yield payload
+                if require_json and self._is_text_attachment_complete_json_answer(stream_text):
+                    drain_in_background = True
+                    threading.Thread(target=drain_remaining_stream, name="text-attachment-stream-drain", daemon=True).start()
+                    yield "[DONE]"
+                    return
+        except Exception as exc:
+            stream_error = exc
+        finally:
+            if not drain_in_background:
+                response.close()
 
-        conversation_id = str(stream_state["conversation_id"] or "")
-        stream_error = stream_state["error"] if isinstance(stream_state["error"], Exception) else None
-        if conversation_id:
-            result = self._wait_text_attachment_result(
-                conversation_id,
-                _text_attachment_timeout_secs(),
-                _text_attachment_poll_interval_secs(),
-                require_json=require_json,
-            )
-            if result.get("answer"):
-                yield self._text_attachment_assistant_payload(result)
+        has_stream_answer = bool(stream_text.strip()) and not self._is_text_attachment_pending_answer(stream_text)
+        has_stream_json = self._is_text_attachment_complete_json_answer(stream_text)
+        if has_stream_answer and (not require_json or has_stream_json):
             yield "[DONE]"
             return
+
+        if conversation_id:
+            try:
+                result = self._wait_text_attachment_result(
+                    conversation_id,
+                    _text_attachment_timeout_secs(),
+                    _text_attachment_poll_interval_secs(),
+                    require_json=require_json,
+                )
+                if result.get("answer"):
+                    yield self._text_attachment_assistant_payload(result)
+                yield "[DONE]"
+                return
+            except Exception as exc:
+                if not has_stream_answer:
+                    raise
+                logger.warning({
+                    "event": "text_attachment_conversation_fallback_failed",
+                    "conversation_id": conversation_id,
+                    "error": str(exc)[:300],
+                })
+                yield "[DONE]"
+                return
         recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=_text_attachment_recovery_timeout_secs())
         if recovered_id:
             result = self._wait_text_attachment_result(
@@ -3233,7 +3279,13 @@ class OpenAIBackendAPI:
                         yield self._text_attachment_assistant_payload(result)
                     yield "[DONE]"
                     return
+            if has_stream_answer:
+                yield "[DONE]"
+                return
             raise stream_error
+        if has_stream_answer:
+            yield "[DONE]"
+            return
         raise RuntimeError("conversation_id not found in text attachment stream")
 
     def _report_progress(self, step: str) -> None:
