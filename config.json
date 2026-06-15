@@ -9,6 +9,7 @@
   "text_attachment_poll_initial_wait_secs": 15,
   "text_attachment_recovery_timeout_secs": 120,
   "text_attachment_stream_heartbeat_secs": 10,
+  "sse_stream_heartbeat_secs": 10,
   "text_attachment_submit_retries": 3,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,

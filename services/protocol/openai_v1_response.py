@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import time
 import uuid
+import html
+import json
+import re
 from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
@@ -42,6 +45,9 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
 
+TOOL_CALL_SYSTEM_MESSAGE = """Tool output adapter: when calling tools, output ONLY this XML and no prose/markdown:
+<tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>"""
+
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
 
 
@@ -51,6 +57,89 @@ def is_text_response_request(body: dict[str, Any]) -> bool:
 
 def has_unsupported_response_tools(body: dict[str, Any]) -> bool:
     return has_unsupported_tools(body, {"image_generation", *WEB_SEARCH_TOOL_TYPES})
+
+
+def response_client_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return []
+    result = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type") or "").strip()
+        if tool_type == "image_generation" or tool_type in WEB_SEARCH_TOOL_TYPES:
+            continue
+        result.append(tool)
+    return result
+
+
+def _tool_meta(tool: dict[str, Any]) -> tuple[str, str, object]:
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    name = str(tool.get("name") or fn.get("name") or tool.get("type") or "").strip()
+    desc = str(tool.get("description") or fn.get("description") or "").strip()
+    schema = tool.get("parameters") or tool.get("input_schema") or fn.get("parameters") or fn.get("input_schema") or {}
+    return name, desc, schema
+
+
+def build_tool_prompt(tools: list[dict[str, Any]]) -> str:
+    blocks = []
+    for tool in tools:
+        name, desc, schema = _tool_meta(tool)
+        if not name:
+            continue
+        blocks.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(schema, ensure_ascii=False)}")
+    if not blocks:
+        return ""
+    return "Available tools:\n" + "\n".join(blocks) + f"""
+
+Tool use rules:
+- If the user asks to inspect files, edit code, run commands, or answer from local project state, call a suitable tool first.
+- {TOOL_CALL_SYSTEM_MESSAGE}
+- Put parameters under <parameters> using the exact schema names.
+""".strip()
+
+
+def strip_tool_markup(text: str) -> str:
+    return re.sub(r"(?is)<tool_calls\b[^>]*>.*?</tool_calls>|<tool_call\b[^>]*>.*?</tool_call>|<function_call\b[^>]*>.*?</function_call>|<invoke\b[^>]*>.*?</invoke>", "", text or "").strip()
+
+
+def xml_value(text: str, tag: str) -> str:
+    match = re.search(rf"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", text)
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    cdata = re.fullmatch(r"(?is)<!\[CDATA\[(.*?)]]>", value)
+    return html.unescape(cdata.group(1) if cdata else value).strip()
+
+
+def parse_tool_value(raw: str) -> object:
+    value = xml_value(f"<x>{raw}</x>", "x")
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def parse_tool_params(raw: str) -> dict[str, object]:
+    raw = raw.strip()
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {m.group(1): parse_tool_value(m.group(2)) for m in re.finditer(r"(?is)<([\w.-]+)\b[^>]*>(.*?)</\1>", raw)}
+
+
+def parse_tool_calls(text: str) -> list[tuple[str, dict[str, object]]]:
+    text = re.sub(r"(?is)```.*?```", "", text or "").strip()
+    blocks = re.findall(r"(?is)<tool_call\b[^>]*>(.*?)</tool_call>|<function_call\b[^>]*>(.*?)</function_call>|<invoke\b[^>]*>(.*?)</invoke>", text)
+    result = []
+    for block in (next((part for part in match if part), "") for match in blocks):
+        name = xml_value(block, "tool_name") or xml_value(block, "name") or xml_value(block, "function")
+        params = xml_value(block, "parameters") or xml_value(block, "input") or xml_value(block, "arguments") or "{}"
+        if name:
+            result.append((name, parse_tool_params(params)))
+    return result
 
 
 def response_image_tool(body: dict[str, Any]) -> dict[str, object]:
@@ -108,6 +197,19 @@ def _is_response_content_part(value: object) -> bool:
 
 
 def _message_content_from_response_item(item: dict[str, Any]) -> object:
+    item_type = str(item.get("type") or "").strip()
+    if item_type == "function_call_output":
+        call_id = str(item.get("call_id") or "").strip()
+        output = item.get("output")
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False)
+        return f"Tool result {call_id}: {output}".strip()
+    if item_type == "function_call":
+        name = str(item.get("name") or "").strip()
+        arguments = item.get("arguments") or "{}"
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        return f"<tool_calls><tool_call><tool_name>{name}</tool_name><parameters>{arguments}</parameters></tool_call></tool_calls>"
     content = item.get("content")
     if isinstance(content, list):
         return [dict(part) if isinstance(part, dict) else part for part in content]
@@ -158,9 +260,10 @@ def messages_from_input(input_value: object, instructions: object = None) -> lis
                 pending_parts = []
             if not isinstance(item, dict):
                 continue
+            item_type = str(item.get("type") or "").strip()
             _append_response_message(
                 messages,
-                item.get("role") or "user",
+                item.get("role") or ("assistant" if item_type == "function_call" else "user"),
                 _message_content_from_response_item(item),
             )
         if pending_parts:
@@ -180,6 +283,17 @@ def text_output_item(
         "status": status,
         "role": "assistant",
         "content": [{"type": "output_text", "text": text, "annotations": annotations or []}],
+    }
+
+
+def function_call_item(name: str, arguments: dict[str, object], item_id: str | None = None, call_id: str | None = None, status: str = "completed") -> dict[str, Any]:
+    return {
+        "id": item_id or f"fc_{uuid.uuid4().hex}",
+        "type": "function_call",
+        "status": status,
+        "call_id": call_id or f"call_{uuid.uuid4().hex}",
+        "name": name,
+        "arguments": json.dumps(arguments or {}, ensure_ascii=False),
     }
 
 
@@ -269,7 +383,11 @@ def response_completed(
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
-    if has_unsupported_response_tools(body):
+    client_tools = response_client_tools(body)
+    tool_prompt = build_tool_prompt(client_tools)
+    if tool_prompt:
+        messages.insert(0, {"role": "system", "content": tool_prompt})
+    elif has_unsupported_response_tools(body):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, messages
 
@@ -277,25 +395,57 @@ def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
+    tools = response_client_tools(body)
     response_id = f"resp_{uuid.uuid4().hex}"
     item_id = f"msg_{uuid.uuid4().hex}"
     created = int(time.time())
     full_text = ""
     yield response_created(response_id, model, created)
-    yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
+    if not tools:
+        yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
     request = ConversationRequest(model=model, messages=messages)
     for delta in stream_text_deltas(backend, request):
         full_text += delta
-        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
-    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
-    item = text_output_item(full_text, item_id, "completed")
-    yield {"type": "response.output_item.done", "output_index": 0, "item": item}
+        if not tools:
+            yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
+    output: list[dict[str, Any]] = []
+    text = strip_tool_markup(full_text) if tools else full_text
+    output_index = 0
+    if text or not tools:
+        if tools:
+            yield {"type": "response.output_item.added", "output_index": output_index, "item": text_output_item("", item_id, "in_progress")}
+        yield {"type": "response.output_text.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "text": text}
+        item = text_output_item(text, item_id, "completed")
+        yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
+        output.append(item)
+        output_index += 1
+    for name, arguments in parse_tool_calls(full_text):
+        item = function_call_item(name, arguments, status="in_progress")
+        done_item = dict(item)
+        done_item["status"] = "completed"
+        item["arguments"] = ""
+        yield {"type": "response.output_item.added", "output_index": output_index, "item": item}
+        yield {
+            "type": "response.function_call_arguments.delta",
+            "item_id": item["id"],
+            "output_index": output_index,
+            "delta": done_item["arguments"],
+        }
+        yield {
+            "type": "response.function_call_arguments.done",
+            "item_id": item["id"],
+            "output_index": output_index,
+            "arguments": done_item["arguments"],
+        }
+        yield {"type": "response.output_item.done", "output_index": output_index, "item": done_item}
+        output.append(done_item)
+        output_index += 1
     usage = token_usage(
         input_text_tokens=count_message_text_tokens(messages, model),
         input_image_tokens=count_message_image_tokens(messages, model),
         output_text_tokens=count_text_tokens(full_text, model),
     )
-    yield response_completed(response_id, model, created, [item], usage)
+    yield response_completed(response_id, model, created, output, usage)
 
 
 def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:

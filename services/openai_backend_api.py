@@ -159,13 +159,17 @@ def _is_retryable_connection_error(error: object) -> bool:
         or "ssl: wrong_version_number" in text
         or "ssl: certificate_verify_failed" in text
         or "curl: (28)" in text
+        or "curl: (56)" in text
         or "operation timed out" in text
         or "connection timed out" in text
         or "read timed out" in text
         or "connect timeout" in text
+        or "connection closed abruptly" in text
+        or "connection closed" in text
         or "connection aborted" in text
         or "remote disconnected" in text
         or "connection reset by peer" in text
+        or "unexpected eof" in text
     )
 
 
@@ -2989,7 +2993,13 @@ class OpenAIBackendAPI:
             "file_name": file_name,
             "file_size": len(data),
             "mime_type": mime_type,
+            "width": item.get("width"),
+            "height": item.get("height"),
         }
+
+    @staticmethod
+    def _text_attachment_is_image(item: Dict[str, Any]) -> bool:
+        return str(item.get("mime_type") or "").lower().startswith("image/")
 
     def _prepare_text_attachment_conversation(self, prompt: str, attachment_mime_types: list[str], model: str, thinking_effort: str = "") -> str:
         path = "/backend-api/f/conversation/prepare"
@@ -3038,8 +3048,9 @@ class OpenAIBackendAPI:
             model: str,
             thinking_effort: str = "",
     ) -> requests.Response:
-        metadata: Dict[str, Any] = {
-            "attachments": [{
+        metadata_attachments = []
+        for item in uploaded:
+            attachment = {
                 "id": item["file_id"],
                 "size": item["file_size"],
                 "name": item["file_name"],
@@ -3047,19 +3058,43 @@ class OpenAIBackendAPI:
                 "source": "local",
                 "library_file_id": item["library_file_id"],
                 "is_big_paste": False,
-            } for item in uploaded],
+            }
+            if self._text_attachment_is_image(item):
+                if item.get("width"):
+                    attachment["width"] = item["width"]
+                if item.get("height"):
+                    attachment["height"] = item["height"]
+            metadata_attachments.append(attachment)
+        metadata: Dict[str, Any] = {
+            "attachments": metadata_attachments,
             "selected_sources": [],
             "selected_github_repos": [],
             "selected_all_github_repos": False,
             "serialization_metadata": {"custom_symbol_offsets": []},
         }
+        image_parts = [
+            {
+                "content_type": "image_asset_pointer",
+                "asset_pointer": f"sediment://{item['file_id']}",
+                "size_bytes": item["file_size"],
+                **({"width": item["width"]} if item.get("width") else {}),
+                **({"height": item["height"]} if item.get("height") else {}),
+            }
+            for item in uploaded
+            if self._text_attachment_is_image(item)
+        ]
+        content: Dict[str, Any] = (
+            {"content_type": "multimodal_text", "parts": [*image_parts, prompt]}
+            if image_parts
+            else {"content_type": "text", "parts": [prompt]}
+        )
         payload: Dict[str, Any] = {
             "action": "next",
             "messages": [{
                 "id": new_uuid(),
                 "author": {"role": "user"},
                 "create_time": time.time(),
-                "content": {"content_type": "text", "parts": [prompt]},
+                "content": content,
                 "metadata": metadata,
             }],
             "parent_message_id": "client-created-root",

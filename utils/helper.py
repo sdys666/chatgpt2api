@@ -2,7 +2,9 @@ import base64
 import hashlib
 import json
 import mimetypes
+import queue
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -191,10 +193,55 @@ def ensure_ok(response: requests.Response, context: str) -> None:
     raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
 
 
+_SSE_DONE = object()
+
+
+def _sse_heartbeat_secs() -> float:
+    try:
+        from services.config import config
+
+        value = float(config.data.get("sse_stream_heartbeat_secs") or 10.0)
+    except Exception:
+        value = 10.0
+    return min(max(value, 1.0), 60.0)
+
+
+def _sse_event_name(item: object) -> str:
+    if not isinstance(item, dict):
+        return ""
+    event_type = str(item.get("type") or "").strip()
+    if not event_type:
+        return ""
+    return event_type if re.fullmatch(r"[\w.-]+", event_type) else ""
+
+
 def sse_json_stream(items) -> Iterator[str]:
     yield ": stream-open\n\n"
+    stream_queue: queue.Queue[object] = queue.Queue()
+
+    def consume() -> None:
+        try:
+            for item in items:
+                stream_queue.put(item)
+            stream_queue.put(_SSE_DONE)
+        except Exception as exc:
+            stream_queue.put(exc)
+
+    threading.Thread(target=consume, daemon=True).start()
     try:
-        for item in items:
+        while True:
+            try:
+                item = stream_queue.get(timeout=_sse_heartbeat_secs())
+            except queue.Empty:
+                yield ": keep-alive\n\n"
+                continue
+            if item is _SSE_DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            event_name = _sse_event_name(item)
+            if event_name:
+                yield f"event: {event_name}\n"
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
     except Exception as exc:
         logger.warning({
@@ -205,6 +252,7 @@ def sse_json_stream(items) -> Iterator[str]:
         error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
             "error": {"message": str(exc), "type": exc.__class__.__name__}
         }
+        yield "event: error\n"
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
