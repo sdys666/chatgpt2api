@@ -2018,6 +2018,8 @@ class OpenAIBackendAPI:
     def _wait_text_attachment_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
         deadline = time.time() + timeout_secs
         last_result: Dict[str, Any] | None = None
+        last_answer = ""
+        stable_json_hits = 0
         retryable_errors = 0
         while time.time() < deadline:
             try:
@@ -2038,6 +2040,20 @@ class OpenAIBackendAPI:
             if last_result and last_result.get("answer"):
                 if last_result.get("status") in SEARCH_DONE_STATUS:
                     return last_result
+                answer = str(last_result.get("answer") or "")
+                if self._is_text_attachment_complete_json_answer(answer):
+                    stable_json_hits = stable_json_hits + 1 if answer == last_answer else 1
+                    last_answer = answer
+                    if stable_json_hits >= 2:
+                        logger.info({
+                            "event": "text_attachment_complete_json_fallback",
+                            "conversation_id": conversation_id,
+                            "status": last_result.get("status") or "",
+                        })
+                        return last_result
+                else:
+                    stable_json_hits = 0
+                    last_answer = answer
             time.sleep(poll_interval_secs)
         if last_result and last_result.get("answer"):
             return last_result
@@ -2073,6 +2089,30 @@ class OpenAIBackendAPI:
     def _is_text_attachment_pending_answer(answer: str) -> bool:
         value = str(answer or "").strip()
         return bool(value and all(marker in value for marker in TEXT_ATTACHMENT_PENDING_MARKERS))
+
+    @staticmethod
+    def _is_text_attachment_complete_json_answer(answer: str) -> bool:
+        text = str(answer or "").strip()
+        if not text:
+            return False
+        candidates = [text]
+        fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
+        if fence:
+            candidates.insert(0, fence.group(1).strip())
+        for candidate in list(candidates):
+            for opener, closer in (("{", "}"), ("[", "]")):
+                start = candidate.find(opener)
+                end = candidate.rfind(closer)
+                if start >= 0 and end > start:
+                    candidates.append(candidate[start:end + 1].strip())
+        for candidate in candidates:
+            try:
+                decoded = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(decoded, (dict, list)):
+                return True
+        return False
 
     @staticmethod
     def _text_attachment_assistant_payload(result: Dict[str, Any]) -> str:
