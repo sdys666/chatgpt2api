@@ -2167,11 +2167,19 @@ class OpenAIBackendAPI:
                 messages.append(message)
         sorted_messages = sorted(messages, key=lambda item: float(item.get("create_time") or 0.0), reverse=True)
         message = sorted_messages[0] if sorted_messages else {}
+        json_message: Dict[str, Any] | None = None
+        text_message: Dict[str, Any] | None = None
         for candidate in sorted_messages:
             candidate_answer = self._search_message_text(candidate)
-            if candidate_answer and not self._is_text_attachment_pending_answer(candidate_answer):
-                message = candidate
+            if candidate_answer and self._is_text_attachment_complete_json_answer(candidate_answer):
+                json_message = candidate
                 break
+            if text_message is None and candidate_answer and not self._is_text_attachment_pending_answer(candidate_answer):
+                text_message = candidate
+        if json_message is not None:
+            message = json_message
+        elif text_message is not None:
+            message = text_message
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
         answer = self._search_message_text(message)
@@ -2205,13 +2213,23 @@ class OpenAIBackendAPI:
                 end = candidate.rfind(closer)
                 if start >= 0 and end > start:
                     candidates.append(candidate[start:end + 1].strip())
+        decoder = json.JSONDecoder()
         for candidate in candidates:
             try:
                 decoded = json.loads(candidate)
             except Exception:
-                continue
+                decoded = None
             if isinstance(decoded, (dict, list)):
                 return True
+            for index, char in enumerate(candidate):
+                if char not in "{[":
+                    continue
+                try:
+                    decoded, _ = decoder.raw_decode(candidate[index:])
+                except Exception:
+                    continue
+                if isinstance(decoded, (dict, list)):
+                    return True
         return False
 
     @staticmethod
@@ -2244,14 +2262,28 @@ class OpenAIBackendAPI:
     def _search_message_text(self, message: Any) -> str:
         content = message.get("content") if isinstance(message, dict) else {}
         parts = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, str):
+                if value.strip():
+                    parts.append(value)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    collect(item)
+                return
+            if isinstance(value, dict):
+                for key in ("text", "summary", "content", "code", "value", "result"):
+                    if key in value:
+                        collect(value.get(key))
+                if "parts" in value:
+                    collect(value.get("parts"))
+
         if isinstance(content, dict):
             if isinstance(content.get("text"), str):
                 parts.append(content["text"])
             for part in content.get("parts") or []:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif isinstance(part, dict):
-                    parts.extend(str(part.get(key) or "") for key in ("text", "summary", "content") if part.get(key))
+                collect(part)
         elif isinstance(content, str):
             parts.append(content)
         return "\n".join(part.strip() for part in parts if str(part).strip()).strip()
@@ -3151,25 +3183,30 @@ class OpenAIBackendAPI:
 
         threading.Thread(target=drain_stream, name="text-attachment-stream-drain", daemon=True).start()
         stream_wait_deadline = time.time() + min(30.0, _text_attachment_recovery_timeout_secs())
+        next_recovery_at = time.time() + 3.0
         while not stream_state["conversation_id"] and not stream_done.is_set() and time.time() < stream_wait_deadline:
             stream_ready.wait(min(1.0, max(0.0, stream_wait_deadline - time.time())))
+            if stream_state["conversation_id"] or time.time() < next_recovery_at:
+                continue
+            recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=5.0)
+            if recovered_id:
+                stream_state["conversation_id"] = recovered_id
+                break
+            next_recovery_at = time.time() + 5.0
 
         conversation_id = str(stream_state["conversation_id"] or "")
         stream_error = stream_state["error"] if isinstance(stream_state["error"], Exception) else None
         if conversation_id:
-            try:
-                result = self._wait_text_attachment_result(
-                    conversation_id,
-                    _text_attachment_timeout_secs(),
-                    _text_attachment_poll_interval_secs(),
-                    require_json=require_json,
-                )
-                if result.get("answer"):
-                    yield self._text_attachment_assistant_payload(result)
-                yield "[DONE]"
-                return
-            finally:
-                response.close()
+            result = self._wait_text_attachment_result(
+                conversation_id,
+                _text_attachment_timeout_secs(),
+                _text_attachment_poll_interval_secs(),
+                require_json=require_json,
+            )
+            if result.get("answer"):
+                yield self._text_attachment_assistant_payload(result)
+            yield "[DONE]"
+            return
         recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=_text_attachment_recovery_timeout_secs())
         if recovered_id:
             result = self._wait_text_attachment_result(
