@@ -1,3 +1,7 @@
+volumes:
+  chatgpt2api_venv:
+  chatgpt2api_web_dist:
+
 services:
   app:
     build:
@@ -8,6 +12,9 @@ services:
     ports:
       - "8000:80"
     volumes:
+      - ./:/app
+      - chatgpt2api_venv:/app/.venv
+      - chatgpt2api_web_dist:/app/web_dist
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:

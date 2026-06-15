@@ -1,3 +1,7 @@
+volumes:
+  chatgpt2api_venv:
+  chatgpt2api_web_dist:
+
 services:
   init-config:
     image: python:3.13-alpine
@@ -99,6 +103,9 @@ services:
     ports:
       - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
+      - ./:/app
+      - chatgpt2api_venv:/app/.venv
+      - chatgpt2api_web_dist:/app/web_dist
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
