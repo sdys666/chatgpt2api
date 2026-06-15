@@ -60,4 +60,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Not Found")
         return FileResponse(fallback)
 
+    @app.head("/{full_path:path}", include_in_schema=False)
+    async def serve_web_head(full_path: str):
+        return await serve_web(full_path)
+
     return app
