@@ -3047,6 +3047,7 @@ class OpenAIBackendAPI:
             conduit_token: str,
             model: str,
             thinking_effort: str = "",
+            client_prepare_state: str = "success",
     ) -> requests.Response:
         metadata_attachments = []
         for item in uploaded:
@@ -3099,7 +3100,7 @@ class OpenAIBackendAPI:
             }],
             "parent_message_id": "client-created-root",
             "model": model,
-            "client_prepare_state": "success",
+            "client_prepare_state": client_prepare_state,
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
@@ -3131,7 +3132,11 @@ class OpenAIBackendAPI:
             timeout=_text_attachment_request_timeout_secs(),
             stream=True,
         )
-        ensure_ok(response, path)
+        try:
+            ensure_ok(response, path)
+        except UpstreamHTTPError:
+            response.close()
+            raise
         return response
 
     def _open_text_attachment_conversation(
@@ -3145,7 +3150,18 @@ class OpenAIBackendAPI:
         self._bootstrap()
         requirements = self._get_chat_requirements()
         conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
-        return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort)
+        try:
+            return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort, "sent")
+        except UpstreamHTTPError as exc:
+            if exc.status_code != 422:
+                raise
+            logger.warning({
+                "event": "text_attachment_conversation_retry_prepare_state",
+                "status_code": exc.status_code,
+                "attachment_count": len(uploaded),
+            })
+            conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
+            return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort, "success")
 
     def _text_attachment_stream_text(self, payload: str, current_text: str) -> str:
         try:

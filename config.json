@@ -1,8 +1,8 @@
 {
-  "auth-key": "chatgpt2api",
+  "auth-key": "543472256",
   "refresh_account_interval_minute": 5,
   "image_retention_days": 15,
-  "image_poll_timeout_secs": 120,
+  "image_poll_timeout_secs": 900,
   "text_attachment_timeout_secs": 900,
   "text_attachment_request_timeout_secs": 900,
   "text_attachment_poll_interval_secs": 10,
@@ -13,7 +13,7 @@
   "text_attachment_submit_retries": 3,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,
-  "history_and_training_disabled": true,
+  "history_and_training_disabled": false,
   "log_levels": [
     "debug",
     "error",
