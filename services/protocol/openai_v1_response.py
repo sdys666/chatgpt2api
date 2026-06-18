@@ -380,7 +380,29 @@ def response_completed(
     return response
 
 
-def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+def response_attachments_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
+    attachments = body.get("attachments")
+    if not isinstance(attachments, list):
+        return []
+    return [item for item in attachments if isinstance(item, dict)]
+
+
+def response_thinking_effort_from_body(body: dict[str, Any]) -> str:
+    reasoning = body.get("reasoning") if isinstance(body.get("reasoning"), dict) else {}
+    return str(body.get("thinking_effort") or body.get("reasoning_effort") or reasoning.get("effort") or "").strip()
+
+
+def response_format_from_body(body: dict[str, Any]) -> str:
+    text = body.get("text") if isinstance(body.get("text"), dict) else {}
+    value = body.get("response_format")
+    if isinstance(value, dict):
+        return str(value.get("type") or "").strip()
+    if isinstance(text.get("format"), dict):
+        return str(text["format"].get("type") or "").strip()
+    return str(value or "").strip()
+
+
+def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], str, str]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
     client_tools = response_client_tools(body)
@@ -389,7 +411,7 @@ def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]
         messages.insert(0, {"role": "system", "content": tool_prompt})
     elif has_unsupported_response_tools(body):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
-    return model, messages
+    return model, messages, response_attachments_from_body(body), response_thinking_effort_from_body(body), response_format_from_body(body)
 
 
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
@@ -403,7 +425,13 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     yield response_created(response_id, model, created)
     if not tools:
         yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(
+        model=model,
+        messages=messages,
+        attachments=response_attachments_from_body(body),
+        thinking_effort=response_thinking_effort_from_body(body),
+        response_format=response_format_from_body(body),
+    )
     for delta in stream_text_deltas(backend, request):
         full_text += delta
         if not tools:
@@ -539,9 +567,12 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if is_text_response_request(body):
-        model, messages = text_response_parts(body)
+        model, messages, attachments, _, _ = text_response_parts(body)
         if has_web_search_tool(body) and not has_unsupported_response_tools(body):
             yield from stream_web_search_response(body, messages)
+            return
+        if attachments:
+            yield from stream_text_response(text_backend(), body, messages)
             return
         key = cache_key(body, messages, stream=bool(body.get("stream")))
         yield from chat_completion_cache.get_or_compute_stream(

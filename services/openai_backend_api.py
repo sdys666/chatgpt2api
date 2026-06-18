@@ -4,6 +4,7 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -150,6 +151,13 @@ def _history_and_training_disabled_query() -> str:
     return "true" if _history_and_training_disabled() else "false"
 
 
+def _text_attachment_history_and_training_disabled() -> bool:
+    # 带 MD / 图片附件的文本任务通常要在提交后再次读取 conversation
+    # 才能拿到完整正文。临时会话会导致 /backend-api/conversation/{id}
+    # 返回 conversation_inaccessible，所以附件任务固定使用可回读会话。
+    return False
+
+
 def _is_retryable_connection_error(error: object) -> bool:
     text = str(error or "").lower()
     return (
@@ -186,7 +194,7 @@ def _text_attachment_poll_interval_secs() -> float:
 
 
 def _text_attachment_poll_initial_wait_secs() -> float:
-    return _config_float("text_attachment_poll_initial_wait_secs", 15.0, 0.0, 120.0)
+    return _config_float("text_attachment_poll_initial_wait_secs", 10.0, 0.0, 120.0)
 
 
 def _text_attachment_recovery_timeout_secs() -> float:
@@ -194,10 +202,16 @@ def _text_attachment_recovery_timeout_secs() -> float:
 
 
 def _text_attachment_submit_retries() -> int:
-    return _config_int("text_attachment_submit_retries", 3, 1, 10)
+    return _config_int("text_attachment_submit_retries", 5, 1, 10)
 
 
-def _is_json_response_format(response_format: str) -> bool:
+def _text_attachment_submit_cooldown_secs() -> float:
+    return _config_float("text_attachment_submit_cooldown_secs", 20.0, 0.0, 300.0)
+
+
+def _is_json_response_format(response_format: object) -> bool:
+    if isinstance(response_format, dict):
+        return str(response_format.get("type") or "").strip().lower() in {"json", "json_object"}
     return str(response_format or "").strip().lower() in {"json", "json_object"}
 
 
@@ -210,6 +224,7 @@ SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
+TEXT_ATTACHMENT_DONE_STATUS = {"finished_successfully"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 TEXT_ATTACHMENT_PENDING_MARKERS = ("连接已中断", "等待完整回复")
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
@@ -259,6 +274,9 @@ _CONTENT_POLICY_KEYWORDS = (
     "抱歉，我不能",
 )
 
+_TEXT_ATTACHMENT_SUBMIT_LOCK = threading.Lock()
+_TEXT_ATTACHMENT_NEXT_SUBMIT_AT = 0.0
+
 
 def _is_content_policy_error(error_msg: str) -> bool:
     """检查错误消息是否为内容政策违规。"""
@@ -266,6 +284,30 @@ def _is_content_policy_error(error_msg: str) -> bool:
         return False
     msg_lower = error_msg.lower()
     return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
+
+
+def _reserve_text_attachment_submit_slot() -> None:
+    global _TEXT_ATTACHMENT_NEXT_SUBMIT_AT
+    cooldown = _text_attachment_submit_cooldown_secs()
+    with _TEXT_ATTACHMENT_SUBMIT_LOCK:
+        now = time.time()
+        wait_secs = max(0.0, _TEXT_ATTACHMENT_NEXT_SUBMIT_AT - now)
+        if wait_secs > 0:
+            logger.info({
+                "event": "text_attachment_submit_cooldown_wait",
+                "wait_secs": round(wait_secs, 2),
+            })
+            time.sleep(wait_secs)
+            now = time.time()
+        _TEXT_ATTACHMENT_NEXT_SUBMIT_AT = now + cooldown
+
+
+def _extend_text_attachment_submit_cooldown(wait_secs: float) -> None:
+    global _TEXT_ATTACHMENT_NEXT_SUBMIT_AT
+    if wait_secs <= 0:
+        return
+    with _TEXT_ATTACHMENT_SUBMIT_LOCK:
+        _TEXT_ATTACHMENT_NEXT_SUBMIT_AT = max(_TEXT_ATTACHMENT_NEXT_SUBMIT_AT, time.time() + wait_secs)
 
 
 @dataclass
@@ -968,7 +1010,7 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str, attachment_mime_types: Optional[list[str]] = None) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
         payload = {
@@ -980,7 +1022,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
-            "history_and_training_disabled": _history_and_training_disabled(),
+            "history_and_training_disabled": _text_attachment_history_and_training_disabled(),
             "system_hints": ["picture_v2"],
             "partial_query": {
                 "id": new_uuid(),
@@ -991,6 +1033,8 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if attachment_mime_types:
+            payload["attachment_mime_types"] = attachment_mime_types
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements),
@@ -1074,8 +1118,27 @@ class OpenAIBackendAPI:
             "height": height,
         }
 
+    @staticmethod
+    def _attachment_metadata(item: Dict[str, Any], source: str = "local") -> Dict[str, Any]:
+        attachment = {
+            "id": item["file_id"],
+            "size": item["file_size"],
+            "name": item["file_name"],
+            "mime_type": item["mime_type"],
+            "source": source,
+            "is_big_paste": False,
+        }
+        if item.get("library_file_id"):
+            attachment["library_file_id"] = item["library_file_id"]
+        if item.get("width"):
+            attachment["width"] = item["width"]
+        if item.get("height"):
+            attachment["height"] = item["height"]
+        return attachment
+
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+                                references: Optional[list[Dict[str, Any]]] = None,
+                                text_attachments: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -1095,15 +1158,15 @@ class OpenAIBackendAPI:
             "system_hints": ["picture_v2"],
             "serialization_metadata": {"custom_symbol_offsets": []},
         }
-        if references:
-            metadata["attachments"] = [{
-                "id": item["file_id"],
-                "mimeType": item["mime_type"],
-                "name": item["file_name"],
-                "size": item["file_size"],
-                "width": item["width"],
-                "height": item["height"],
-            } for item in references]
+        metadata_attachments = [self._attachment_metadata(item) for item in references]
+        for item in metadata_attachments:
+            item["mimeType"] = item["mime_type"]
+        metadata_attachments.extend(
+            self._attachment_metadata(item, "library" if item.get("library_file_id") else "local")
+            for item in (text_attachments or [])
+        )
+        if metadata_attachments:
+            metadata["attachments"] = metadata_attachments
         payload = {
             "action": "next",
             "messages": [{
@@ -1121,7 +1184,7 @@ class OpenAIBackendAPI:
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
             "system_hints": ["picture_v2"],
-            "history_and_training_disabled": _history_and_training_disabled(),
+            "history_and_training_disabled": _text_attachment_history_and_training_disabled(),
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": {
@@ -1137,6 +1200,11 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
+        if text_attachments:
+            logger.info({
+                "event": "image_generation_conversation_payload",
+                "payload": self._text_attachment_conversation_summary(payload),
+            })
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -1431,7 +1499,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
-            "history_and_training_disabled": _history_and_training_disabled(),
+            "history_and_training_disabled": _text_attachment_history_and_training_disabled(),
             "system_hints": [],
             "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
             "supports_buffering": True,
@@ -2130,7 +2198,14 @@ class OpenAIBackendAPI:
             if last_result and last_result.get("answer"):
                 answer = str(last_result.get("answer") or "")
                 is_json_answer = self._is_text_attachment_complete_json_answer(answer)
-                if last_result.get("status") in SEARCH_DONE_STATUS and (not require_json or is_json_answer):
+                if last_result.get("status") in TEXT_ATTACHMENT_DONE_STATUS and (not require_json or is_json_answer):
+                    return last_result
+                if require_json and is_json_answer:
+                    logger.info({
+                        "event": "text_attachment_complete_json_immediate",
+                        "conversation_id": conversation_id,
+                        "status": last_result.get("status") or "",
+                    })
                     return last_result
                 if is_json_answer:
                     stable_json_hits = stable_json_hits + 1 if answer == last_answer else 1
@@ -2201,7 +2276,7 @@ class OpenAIBackendAPI:
     @staticmethod
     def _is_text_attachment_pending_answer(answer: str) -> bool:
         value = str(answer or "").strip()
-        return bool(value and all(marker in value for marker in TEXT_ATTACHMENT_PENDING_MARKERS))
+        return bool(value and any(marker in value for marker in TEXT_ATTACHMENT_PENDING_MARKERS))
 
     @staticmethod
     def _is_text_attachment_complete_json_answer(answer: str) -> bool:
@@ -2212,29 +2287,23 @@ class OpenAIBackendAPI:
         fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
         if fence:
             candidates.insert(0, fence.group(1).strip())
-        for candidate in list(candidates):
-            for opener, closer in (("{", "}"), ("[", "]")):
-                start = candidate.find(opener)
-                end = candidate.rfind(closer)
-                if start >= 0 and end > start:
-                    candidates.append(candidate[start:end + 1].strip())
-        decoder = json.JSONDecoder()
         for candidate in candidates:
             try:
                 decoded = json.loads(candidate)
             except Exception:
-                decoded = None
-            if isinstance(decoded, (dict, list)):
+                decoder = json.JSONDecoder()
+                for index, char in enumerate(candidate):
+                    if char != "{":
+                        continue
+                    try:
+                        decoded, _ = decoder.raw_decode(candidate[index:])
+                    except Exception:
+                        continue
+                    if isinstance(decoded, dict):
+                        return True
+                continue
+            if isinstance(decoded, dict):
                 return True
-            for index, char in enumerate(candidate):
-                if char not in "{[":
-                    continue
-                try:
-                    decoded, _ = decoder.raw_decode(candidate[index:])
-                except Exception:
-                    continue
-                if isinstance(decoded, (dict, list)):
-                    return True
         return False
 
     @staticmethod
@@ -2278,7 +2347,7 @@ class OpenAIBackendAPI:
                     collect(item)
                 return
             if isinstance(value, dict):
-                for key in ("text", "summary", "content", "code", "value", "result"):
+                for key in ("text", "summary", "content", "code", "value", "result", "body", "message", "final", "answer", "output_text"):
                     if key in value:
                         collect(value.get(key))
                 if "parts" in value:
@@ -2864,7 +2933,7 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+            yield from self._stream_picture_conversation(prompt, model, images or [], attachments or [])
             return
         if attachments:
             yield from self._stream_text_attachment_conversation(messages or [], model, prompt, attachments, thinking_effort, _is_json_response_format(response_format))
@@ -2942,19 +3011,33 @@ class OpenAIBackendAPI:
 
     def _upload_text_attachment(self, item: Dict[str, Any], index: int) -> Dict[str, Any]:
         data, file_name, mime_type = self._decode_text_attachment(item, index)
+        width = item.get("width")
+        height = item.get("height")
+        if str(mime_type or "").lower().startswith("image/") and (not width or not height):
+            try:
+                image = Image.open(BytesIO(data))
+                image.load()
+                width, height = image.size
+                mime_type = Image.MIME.get(image.format, mime_type or "image/png")
+            except Exception:
+                width, height = item.get("width"), item.get("height")
         path = "/backend-api/files"
+        file_payload = {
+            "file_name": file_name,
+            "file_size": len(data),
+            "use_case": "multimodal",
+            "timezone_offset_min": -480,
+            "reset_rate_limits": False,
+            "store_in_library": True,
+            "library_persistence_mode": "opportunistic",
+        }
+        if width and height:
+            file_payload["width"] = width
+            file_payload["height"] = height
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
-            json={
-                "file_name": file_name,
-                "file_size": len(data),
-                "use_case": "multimodal",
-                "timezone_offset_min": -480,
-                "reset_rate_limits": False,
-                "store_in_library": True,
-                "library_persistence_mode": "opportunistic",
-            },
+            json=file_payload,
             timeout=60,
         )
         ensure_ok(response, path)
@@ -2987,21 +3070,82 @@ class OpenAIBackendAPI:
             timeout=60,
         )
         ensure_ok(response, uploaded_path)
+        uploaded_payload: Dict[str, Any] = {}
+        try:
+            uploaded_payload = response.json()
+        except Exception:
+            uploaded_payload = {}
+        library_file_id = str(payload.get("library_file_id") or uploaded_payload.get("library_file_id") or "")
+        if not library_file_id:
+            logger.warning({
+                "event": "text_attachment_missing_library_file_id",
+                "file_id": file_id,
+                "file_name": file_name,
+                "mime_type": mime_type,
+                "uploaded_response_preview": response.text[:300],
+            })
         return {
             "file_id": file_id,
-            "library_file_id": str(payload.get("library_file_id") or ""),
+            "library_file_id": library_file_id,
             "file_name": file_name,
             "file_size": len(data),
             "mime_type": mime_type,
-            "width": item.get("width"),
-            "height": item.get("height"),
+            "width": width,
+            "height": height,
         }
 
     @staticmethod
     def _text_attachment_is_image(item: Dict[str, Any]) -> bool:
         return str(item.get("mime_type") or "").lower().startswith("image/")
 
-    def _prepare_text_attachment_conversation(self, prompt: str, attachment_mime_types: list[str], model: str, thinking_effort: str = "") -> str:
+    @staticmethod
+    def _text_attachment_conversation_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+        message = ((payload.get("messages") or [{}])[0] or {}) if isinstance(payload.get("messages"), list) else {}
+        content = message.get("content") if isinstance(message, dict) else {}
+        metadata = message.get("metadata") if isinstance(message, dict) else {}
+        parts = content.get("parts") if isinstance(content, dict) else []
+        attachments = metadata.get("attachments") if isinstance(metadata, dict) else []
+
+        part_summary = []
+        for part in parts if isinstance(parts, list) else []:
+            if isinstance(part, str):
+                part_summary.append({"type": "text", "length": len(part)})
+            elif isinstance(part, dict):
+                part_summary.append({
+                    "type": part.get("content_type"),
+                    "has_asset_pointer": bool(part.get("asset_pointer")),
+                    "size_bytes": part.get("size_bytes"),
+                    "width": part.get("width"),
+                    "height": part.get("height"),
+                })
+            else:
+                part_summary.append({"type": type(part).__name__})
+
+        attachment_summary = []
+        for attachment in attachments if isinstance(attachments, list) else []:
+            if not isinstance(attachment, dict):
+                continue
+            attachment_summary.append({
+                "name": attachment.get("name"),
+                "mime_type": attachment.get("mime_type"),
+                "size": attachment.get("size"),
+                "source": attachment.get("source"),
+                "has_library_file_id": bool(attachment.get("library_file_id")),
+                "width": attachment.get("width"),
+                "height": attachment.get("height"),
+            })
+
+        return {
+            "model": payload.get("model"),
+            "client_prepare_state": payload.get("client_prepare_state"),
+            "thinking_effort": payload.get("thinking_effort"),
+            "content_type": content.get("content_type") if isinstance(content, dict) else "",
+            "part_summary": part_summary,
+            "attachment_count": len(attachment_summary),
+            "attachments": attachment_summary,
+        }
+
+    def _prepare_text_attachment_conversation(self, prompt: str, uploaded: list[Dict[str, Any]], model: str, thinking_effort: str = "") -> str:
         path = "/backend-api/f/conversation/prepare"
         payload: Dict[str, Any] = {
             "action": "next",
@@ -3012,7 +3156,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
-            "history_and_training_disabled": _history_and_training_disabled(),
+            "history_and_training_disabled": _text_attachment_history_and_training_disabled(),
             "system_hints": [],
             "partial_query": {
                 "id": new_uuid(),
@@ -3023,8 +3167,8 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
-        if attachment_mime_types:
-            payload["attachment_mime_types"] = attachment_mime_types
+        if uploaded:
+            payload["attachment_mime_types"] = [item["mime_type"] for item in uploaded]
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
         response = self.session.post(
@@ -3057,9 +3201,10 @@ class OpenAIBackendAPI:
                 "name": item["file_name"],
                 "mime_type": item["mime_type"],
                 "source": "local",
-                "library_file_id": item["library_file_id"],
                 "is_big_paste": False,
             }
+            if item.get("library_file_id"):
+                attachment["library_file_id"] = item["library_file_id"]
             if self._text_attachment_is_image(item):
                 if item.get("width"):
                     attachment["width"] = item["width"]
@@ -3104,7 +3249,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
-            "history_and_training_disabled": _history_and_training_disabled(),
+            "history_and_training_disabled": _text_attachment_history_and_training_disabled(),
             "enable_message_followups": True,
             "system_hints": [],
             "supports_buffering": True,
@@ -3134,7 +3279,13 @@ class OpenAIBackendAPI:
         )
         try:
             ensure_ok(response, path)
-        except UpstreamHTTPError:
+        except UpstreamHTTPError as exc:
+            logger.warning({
+                "event": "text_attachment_conversation_start_failed",
+                "status_code": exc.status_code,
+                "body": exc.body,
+                "payload": self._text_attachment_conversation_summary(payload),
+            })
             response.close()
             raise
         return response
@@ -3149,7 +3300,7 @@ class OpenAIBackendAPI:
         uploaded = [self._upload_text_attachment(item, index) for index, item in enumerate(attachments, start=1)]
         self._bootstrap()
         requirements = self._get_chat_requirements()
-        conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
+        conduit_token = self._prepare_text_attachment_conversation(prompt_text, uploaded, model, effort)
         try:
             return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort, "sent")
         except UpstreamHTTPError as exc:
@@ -3159,9 +3310,10 @@ class OpenAIBackendAPI:
                 "event": "text_attachment_conversation_retry_prepare_state",
                 "status_code": exc.status_code,
                 "attachment_count": len(uploaded),
+                "client_prepare_state": "sent",
             })
-            conduit_token = self._prepare_text_attachment_conversation(prompt_text, [item["mime_type"] for item in uploaded], model, effort)
-            return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort, "success")
+            conduit_token = self._prepare_text_attachment_conversation(prompt_text, uploaded, model, effort)
+            return self._start_text_attachment_conversation(prompt_text, uploaded, requirements, conduit_token, model, effort, "sent")
 
     def _text_attachment_stream_text(self, payload: str, current_text: str) -> str:
         try:
@@ -3242,23 +3394,30 @@ class OpenAIBackendAPI:
         response: requests.Response | None = None
         for attempt in range(1, _text_attachment_submit_retries() + 1):
             try:
+                _reserve_text_attachment_submit_slot()
                 response = self._open_text_attachment_conversation(prompt_text, attachments, model, effort)
                 break
+            except UpstreamHTTPError as exc:
+                if exc.status_code not in (429, 500, 502, 503, 504) or attempt >= _text_attachment_submit_retries():
+                    raise
+                if exc.status_code == 429:
+                    wait_secs = exc.retry_after if exc.retry_after is not None else max(60.0, _text_attachment_submit_cooldown_secs())
+                else:
+                    wait_secs = exc.retry_after if exc.retry_after is not None else min(10.0 * attempt, 30.0)
+                _extend_text_attachment_submit_cooldown(wait_secs)
+                logger.warning({
+                    "event": "text_attachment_submit_upstream_retry",
+                    "attempt": attempt,
+                    "max_attempts": _text_attachment_submit_retries(),
+                    "status_code": exc.status_code,
+                    "wait_secs": wait_secs,
+                    "error": str(exc)[:300],
+                })
+                time.sleep(wait_secs)
+                continue
             except Exception as exc:
                 if not _is_retryable_connection_error(exc) or attempt >= _text_attachment_submit_retries():
                     raise
-                recovered_id = self.find_conversation_by_prompt(prompt_text, started_at, timeout_secs=_text_attachment_recovery_timeout_secs())
-                if recovered_id:
-                    result = self._wait_text_attachment_result(
-                        recovered_id,
-                        _text_attachment_timeout_secs(),
-                        _text_attachment_poll_interval_secs(),
-                        require_json=require_json,
-                    )
-                    if result.get("answer"):
-                        yield self._text_attachment_assistant_payload(result)
-                    yield "[DONE]"
-                    return
                 logger.warning({
                     "event": "text_attachment_submit_retry",
                     "attempt": attempt,
@@ -3272,14 +3431,15 @@ class OpenAIBackendAPI:
         conversation_id = ""
         stream_text = ""
         stream_error: Exception | None = None
+        stream_done = False
 
         try:
             for payload in iter_sse_payloads(response):
                 if payload == "[DONE]":
+                    stream_done = True
                     break
                 conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 stream_text = self._text_attachment_stream_text(payload, stream_text)
-                yield payload
         except Exception as exc:
             stream_error = exc
         finally:
@@ -3287,10 +3447,16 @@ class OpenAIBackendAPI:
 
         has_stream_answer = bool(stream_text.strip()) and not self._is_text_attachment_pending_answer(stream_text)
         has_stream_json = self._is_text_attachment_complete_json_answer(stream_text)
-        if has_stream_answer and (not require_json or has_stream_json):
+        if stream_error is None and (stream_done or has_stream_answer):
+            yield self._text_attachment_assistant_payload({
+                "conversation_id": conversation_id,
+                "answer": stream_text,
+                "status": "finished_successfully",
+                "assistant_message_id": new_uuid(),
+                "create_time": time.time(),
+            })
             yield "[DONE]"
             return
-
         if conversation_id:
             try:
                 result = self._wait_text_attachment_result(
@@ -3304,12 +3470,19 @@ class OpenAIBackendAPI:
                 yield "[DONE]"
                 return
             except Exception as exc:
-                if not has_stream_answer:
+                if not has_stream_answer or (require_json and not has_stream_json):
                     raise
                 logger.warning({
                     "event": "text_attachment_conversation_fallback_failed",
                     "conversation_id": conversation_id,
                     "error": str(exc)[:300],
+                })
+                yield self._text_attachment_assistant_payload({
+                    "conversation_id": conversation_id,
+                    "answer": stream_text,
+                    "status": "finished_successfully",
+                    "assistant_message_id": new_uuid(),
+                    "create_time": time.time(),
                 })
                 yield "[DONE]"
                 return
@@ -3339,11 +3512,15 @@ class OpenAIBackendAPI:
                         yield self._text_attachment_assistant_payload(result)
                     yield "[DONE]"
                     return
-            if has_stream_answer:
-                yield "[DONE]"
-                return
             raise stream_error
-        if has_stream_answer:
+        if has_stream_answer and (not require_json or has_stream_json):
+            yield self._text_attachment_assistant_payload({
+                "conversation_id": conversation_id,
+                "answer": stream_text,
+                "status": "finished_successfully",
+                "assistant_message_id": new_uuid(),
+                "create_time": time.time(),
+            })
             yield "[DONE]"
             return
         raise RuntimeError("conversation_id not found in text attachment stream")
@@ -3361,19 +3538,38 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            attachments: Optional[list[Dict[str, Any]]] = None,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        uploaded_attachments = [self._upload_text_attachment(item, index) for index, item in enumerate(attachments or [], start=1)]
+        if uploaded_attachments:
+            logger.info({
+                "event": "image_generation_attachments_uploaded",
+                "reference_count": len(references),
+                "attachment_count": len(uploaded_attachments),
+                "attachments": [
+                    {
+                        "name": item.get("file_name"),
+                        "mime_type": item.get("mime_type"),
+                        "size": item.get("file_size"),
+                        "has_library_file_id": bool(item.get("library_file_id")),
+                    }
+                    for item in uploaded_attachments
+                ],
+            })
         self._report_progress("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        attachment_mime_types = [item["mime_type"] for item in references]
+        attachment_mime_types.extend(item["mime_type"] for item in uploaded_attachments)
+        conduit_token = self._prepare_image_conversation(prompt, requirements, model, attachment_mime_types)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, uploaded_attachments)
         self._report_progress("generating")
         try:
             yield from iter_sse_payloads(response)

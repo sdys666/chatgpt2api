@@ -327,6 +327,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         model, messages, attachments, thinking_effort, response_format = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
+        if attachments:
+            return stream_text_chat_completion(text_backend(), messages, model, attachments, thinking_effort, response_format)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
@@ -337,6 +339,12 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     model, messages, attachments, thinking_effort, response_format = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
+    if attachments:
+        return completion_response(
+            model,
+            collect_text(text_backend(), ConversationRequest(model=model, messages=messages, attachments=attachments, thinking_effort=thinking_effort, response_format=response_format)),
+            messages=messages,
+        )
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,

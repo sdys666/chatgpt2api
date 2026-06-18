@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import mimetypes
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.datastructures import UploadFile
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
@@ -77,6 +81,80 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
         raise
 
 
+def _clean_form_text(value: object, default: str = "") -> str:
+    text = str(value if value is not None else default).strip()
+    return text or default
+
+
+async def _studio_form_payload(request: Request) -> tuple[dict[str, object], list[dict[str, object]], list[tuple[bytes, str, str]]]:
+    form = await request.form()
+    prompt = _clean_form_text(form.get("prompt"))
+    if not prompt:
+        raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+    payload: dict[str, object] = {
+        "prompt": prompt,
+        "text_model": _clean_form_text(form.get("text_model") or form.get("model"), "auto"),
+        "image_model": _clean_form_text(form.get("image_model") or form.get("model"), "gpt-image-2"),
+        "n": int(_clean_form_text(form.get("n"), "1")),
+        "size": _clean_form_text(form.get("size")),
+        "quality": _clean_form_text(form.get("quality"), "auto"),
+    }
+    attachments: list[dict[str, object]] = []
+    images: list[tuple[bytes, str, str]] = []
+    for key, value in form.multi_items():
+        if not isinstance(value, UploadFile):
+            continue
+        data = await value.read()
+        if not data:
+            continue
+        filename = value.filename or ("image.png" if str(value.content_type or "").startswith("image/") else "attachment.md")
+        mime_type = value.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        item = {
+            "filename": filename,
+            "mime_type": mime_type,
+            "base64": base64.b64encode(data).decode("ascii"),
+        }
+        if key in {"md", "md[]", "attachment", "attachments"} or filename.lower().endswith(".md") or mime_type in {"text/markdown", "text/plain"}:
+            attachments.append(item)
+            continue
+        if key in {"image", "image[]", "images", "images[]"} or mime_type.startswith("image/"):
+            images.append((data, filename, mime_type))
+    return payload, attachments, images
+
+
+def _studio_text_body(payload: dict[str, object], attachments: list[dict[str, object]], images: list[tuple[bytes, str, str]]) -> dict[str, object]:
+    merged_attachments = list(attachments)
+    for data, filename, mime_type in images:
+        merged_attachments.append({
+            "filename": filename,
+            "mime_type": mime_type,
+            "base64": base64.b64encode(data).decode("ascii"),
+        })
+    return {
+        "model": payload["text_model"],
+        "messages": [{"role": "user", "content": payload["prompt"]}],
+        "attachments": merged_attachments,
+        "stream": True,
+    }
+
+
+def _studio_image_body(payload: dict[str, object], attachments: list[dict[str, object]], request: Request, images: list[tuple[bytes, str, str]] | None = None) -> dict[str, object]:
+    body: dict[str, object] = {
+        "model": payload["image_model"],
+        "prompt": payload["prompt"],
+        "attachments": attachments,
+        "n": payload["n"],
+        "size": payload["size"] or None,
+        "quality": payload["quality"],
+        "response_format": "b64_json",
+        "stream": True,
+        "base_url": resolve_image_base_url(request),
+    }
+    if images is not None:
+        body["images"] = images
+    return body
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -134,6 +212,46 @@ def create_router() -> APIRouter:
         )
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_chat_complete.handle, payload)
+
+    @router.post("/v1/studio/md-to-text")
+    async def studio_md_to_text(request: Request, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        payload, attachments, _images = await _studio_form_payload(request)
+        body = _studio_text_body(payload, attachments, [])
+        call = LoggedCall(identity, "/v1/chat/studio-md-to-text", str(body["model"]), "MD返回文字", request_text=str(payload["prompt"]))
+        await filter_or_log(call, str(payload["prompt"]))
+        return await call.run(openai_v1_chat_complete.handle, body)
+
+    @router.post("/v1/studio/md-to-image")
+    async def studio_md_to_image(request: Request, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        payload, attachments, _images = await _studio_form_payload(request)
+        body = _studio_image_body(payload, attachments, request)
+        call = LoggedCall(identity, "/v1/images/studio-md-to-image", str(body["model"]), "MD返回图片", request_text=str(payload["prompt"]))
+        await filter_or_log(call, str(payload["prompt"]))
+        return await call.run(openai_v1_image_generations.handle, body)
+
+    @router.post("/v1/studio/md-images-to-text")
+    async def studio_md_images_to_text(request: Request, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        payload, attachments, images = await _studio_form_payload(request)
+        if not images:
+            raise HTTPException(status_code=400, detail={"error": "image is required"})
+        body = _studio_text_body(payload, attachments, images)
+        call = LoggedCall(identity, "/v1/chat/studio-md-images-to-text", str(body["model"]), "MD+图片返回文字", request_text=str(payload["prompt"]))
+        await filter_or_log(call, str(payload["prompt"]))
+        return await call.run(openai_v1_chat_complete.handle, body)
+
+    @router.post("/v1/studio/md-images-to-image")
+    async def studio_md_images_to_image(request: Request, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        payload, attachments, images = await _studio_form_payload(request)
+        if not images:
+            raise HTTPException(status_code=400, detail={"error": "image is required"})
+        body = _studio_image_body(payload, attachments, request, images)
+        call = LoggedCall(identity, "/v1/images/studio-md-images-to-image", str(body["model"]), "MD+图片返回图片", request_text=str(payload["prompt"]))
+        await filter_or_log(call, str(payload["prompt"]))
+        return await call.run(openai_v1_image_edit.handle, body)
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):

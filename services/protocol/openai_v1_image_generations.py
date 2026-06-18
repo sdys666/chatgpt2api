@@ -10,6 +10,7 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_output_items_tokens, image_usage
+from utils.log import logger
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
@@ -21,6 +22,20 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
+    attachments = body.get("attachments") if isinstance(body.get("attachments"), list) else []
+    logger.info({
+        "event": "image_generation_request_received",
+        "attachment_count": len(attachments),
+        "attachments": [
+            {
+                "filename": item.get("filename") or item.get("file_name"),
+                "mime_type": item.get("mime_type") or item.get("mimeType"),
+                "has_content": bool(item.get("content") or item.get("text") or item.get("data") or item.get("base64")),
+            }
+            for item in attachments
+            if isinstance(item, dict)
+        ],
+    })
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -29,6 +44,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         quality=quality,
         response_format=response_format,
         base_url=base_url,
+        attachments=attachments,
         message_as_error=True,
         progress_callback=progress_callback,
     ))

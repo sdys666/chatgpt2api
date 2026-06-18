@@ -670,7 +670,7 @@ def conversation_events(
         messages=normalized,
         model=model,
         prompt=final_prompt,
-        attachments=attachments if not image_model else None,
+        attachments=attachments,
         thinking_effort=thinking_effort if not image_model else "",
         response_format=response_format if not image_model else "",
         images=images if image_model else None,
@@ -781,6 +781,7 @@ def stream_image_outputs(
             backend,
             prompt=request.prompt,
             model=request.model,
+            attachments=request.attachments,
             images=request.images or [],
             size=request.size,
             quality=request.quality,
@@ -1270,6 +1271,13 @@ def _generate_single_image(
             "account_email": account_email,
             "account_found": bool(account),
             "index": index,
+        })
+        logger.info({
+            "event": "image_single_request_start",
+            "index": index,
+            "model": request.model,
+            "image_count": len(request.images or []),
+            "attachment_count": len(request.attachments or []),
         })
         try:
             backend = OpenAIBackendAPI(access_token=token)

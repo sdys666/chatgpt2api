@@ -15,6 +15,7 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
+from utils.log import logger
 
 
 def _composite_mask(
@@ -60,6 +61,21 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
+    attachments = body.get("attachments") if isinstance(body.get("attachments"), list) else []
+    logger.info({
+        "event": "image_edit_request_received",
+        "image_count": len(images) if isinstance(images, list) else 0,
+        "attachment_count": len(attachments),
+        "attachments": [
+            {
+                "filename": item.get("filename") or item.get("file_name"),
+                "mime_type": item.get("mime_type") or item.get("mimeType"),
+                "has_content": bool(item.get("content") or item.get("text") or item.get("data") or item.get("base64")),
+            }
+            for item in attachments
+            if isinstance(item, dict)
+        ],
+    })
     encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
@@ -72,6 +88,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         response_format=response_format,
         base_url=base_url,
         images=encoded_images,
+        attachments=attachments,
         message_as_error=True,
         progress_callback=progress_callback,
     ))

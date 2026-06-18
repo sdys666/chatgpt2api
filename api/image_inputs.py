@@ -15,6 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
+from utils.log import logger
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -65,10 +66,11 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     prompt = _clean(fields.get("prompt"))
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+    n = _parse_count(fields.get("n"))
     payload = {
         "prompt": prompt,
         "model": _clean(fields.get("model"), "gpt-image-2"),
-        "n": _parse_count(fields.get("n")),
+        "n": n,
         "size": _clean(fields.get("size")) or None,
         "quality": _clean(fields.get("quality"), "auto"),
         "response_format": _clean(fields.get("response_format"), "b64_json"),
@@ -76,7 +78,32 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     }
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
+    attachments = _parse_attachments(fields.get("attachments"))
+    if attachments:
+        payload["attachments"] = attachments
     return payload
+
+
+def _parse_attachments(value: object) -> list[dict[str, Any]]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail={"error": "attachments must be a JSON array"}) from exc
+    if not isinstance(value, list):
+        raise HTTPException(status_code=400, detail={"error": "attachments must be an array"})
+    return [item for item in value if isinstance(item, dict)]
+
+
+async def _read_attachment_field(value: object) -> object:
+    if isinstance(value, str) or value is None:
+        return value
+    if isinstance(value, UploadFile):
+        data = await value.read()
+        return data.decode("utf-8", "replace")
+    return value
 
 
 def _json_reference_value(value: object) -> object:
@@ -182,9 +209,24 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
         return _payload_from_fields(body), _json_image_sources(body), _json_mask_sources(body)
 
     form = await request.form()
+    logger.info({
+        "event": "image_edit_form_received",
+        "content_type": request.headers.get("content-type", ""),
+        "fields": [
+            {
+                "key": key,
+                "type": type(value).__name__,
+                "length": len(value) if isinstance(value, str) else None,
+                "filename": getattr(value, "filename", None),
+            }
+            for key, value in form.multi_items()
+        ],
+    })
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream", "attachments"):
         value = form.get(key)
+        if key == "attachments":
+            value = await _read_attachment_field(value)
         if isinstance(value, str):
             fields[key] = value
     sources: list[ImageSource] = []
